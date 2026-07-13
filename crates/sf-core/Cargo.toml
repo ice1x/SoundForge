@@ -1,0 +1,14 @@
+[package]
+name = "sf-core"
+description = "SoundForge analysis core: seamless range statistics over huge audio via a summary pyramid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sf_core"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]

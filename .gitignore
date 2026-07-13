@@ -1,0 +1,11 @@
+# Rust / Cargo build artifacts
+/target
+
+# Tauri generated schemas
+/src-tauri/gen/schemas
+
+# macOS
+.DS_Store
+
+# Editor backups
+**/*.rs.bk
