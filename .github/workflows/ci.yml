@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Fast feedback on the pure-Rust analysis core. sf-core has no GUI or audio
+  # hardware dependencies, so it lints and tests on plain Ubuntu with no system
+  # packages. This is where formatting is checked for the whole workspace.
+  core:
+    name: sf-core — fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check (workspace)
+        run: cargo fmt --all --check
+
+      - name: Clippy (sf-core)
+        run: cargo clippy -p sf-core --all-targets -- -D warnings
+
+      - name: Test (sf-core)
+        run: cargo test -p sf-core --all-targets
+
+      - name: Doc tests (sf-core)
+        run: cargo test -p sf-core --doc
+
+  # Full workspace, including the Tauri shell, on an Apple-Silicon macOS runner.
+  # This matches the project's Apple-Silicon-first target and builds the Tauri
+  # crate against the native system WebView with no extra system packages.
+  workspace:
+    name: workspace — clippy, test (macOS / Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace

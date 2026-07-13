@@ -65,12 +65,13 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 5 — `sf-core::summary::waveform` — min/max-per-pixel bins for the waveform view
 - [x] 6 — Tauri v2 shell (`src-tauri`) loading `ui/index.html`; IPC ping/pong
 - [x] 7 — Logging: `tauri-plugin-log` (stdout + file + webview) + UI→Rust log bridge (`frontend_log`), console/error forwarding; hardened & instrumented record path
-- [ ] 8 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
-- [ ] 9 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
-- [ ] 10 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
-- [ ] 11 — Playback (`cpal` output + `rtrb` ring buffer), play selection
-- [ ] 12 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
-- [ ] 13 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
-- [ ] 14 — WAV export (`hound`) of selection or whole file
-- [ ] 15 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
-- [ ] 16 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
+- [x] 8 — CI: GitHub Actions (`.github/workflows/ci.yml`) — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on `sf-core` (Ubuntu) and the full workspace (Apple-Silicon macOS)
+- [ ] 9 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
+- [ ] 10 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
+- [ ] 11 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
+- [ ] 12 — Playback (`cpal` output + `rtrb` ring buffer), play selection
+- [ ] 13 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
+- [ ] 14 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
+- [ ] 15 — WAV export (`hound`) of selection or whole file
+- [ ] 16 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
+- [ ] 17 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
