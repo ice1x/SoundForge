@@ -80,7 +80,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 7 — Logging: `tauri-plugin-log` (stdout + file + webview) + UI→Rust log bridge (`frontend_log`), console/error forwarding; hardened & instrumented record path
 - [x] 8 — CI: GitHub Actions (`.github/workflows/ci.yml`) — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on `sf-core` (Ubuntu) and the full workspace (Apple-Silicon macOS)
 - [x] 9 — Build script (`scripts/build.sh`) — one entry point for `check`/`build`/`release`/`app`/`dev`/`clean`, mirroring the CI "everything green" gate locally
-- [ ] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
+- [x] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
 - [ ] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
 - [ ] 12 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
 - [ ] 13 — Playback (`cpal` output + `rtrb` ring buffer), play selection

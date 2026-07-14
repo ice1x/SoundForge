@@ -10,5 +10,12 @@ name = "sf_core"
 path = "src/lib.rs"
 
 [dependencies]
+# Decoding + on-disk PCM cache (task 10). The pure-analysis modules (agg/summary/
+# stats) stay dependency-free; only the `decode` module uses these.
+symphonia = { version = "0.5", features = ["all"] }
+memmap2 = "0.9"
+bytemuck = "1"
 
 [dev-dependencies]
+# Synthesize deterministic WAV fixtures for the decode round-trip tests.
+hound = "3"

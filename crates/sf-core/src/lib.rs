@@ -21,9 +21,11 @@
 //! ```
 
 pub mod agg;
+pub mod decode;
 pub mod stats;
 pub mod summary;
 
 pub use agg::Agg;
+pub use decode::{decode_file, DecodeError, PcmCache};
 pub use stats::{linear_to_db, RangeStats};
 pub use summary::Analyzer;
