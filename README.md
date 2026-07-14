@@ -45,6 +45,19 @@ SoundForge/
 - Everything must be green before moving on: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`.
 - **All documentation and docstrings are in English only.**
 
+### Build script
+
+`scripts/build.sh` is the single entry point for the common build/verify tasks
+(it runs from any working directory). Run `scripts/build.sh help` for the full
+list; the most useful commands are:
+
+| Command | What it does |
+|---|---|
+| `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` — the gate that must be green before pushing (mirrors CI) |
+| `scripts/build.sh release` | optimized release build of the whole workspace (default) |
+| `scripts/build.sh app` | bundle the native `.app`/`.dmg` via `cargo tauri build` |
+| `scripts/build.sh dev` | run the app in watch mode via `cargo tauri dev` |
+
 ---
 
 ## Tasks
@@ -65,12 +78,14 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 5 — `sf-core::summary::waveform` — min/max-per-pixel bins for the waveform view
 - [x] 6 — Tauri v2 shell (`src-tauri`) loading `ui/index.html`; IPC ping/pong
 - [x] 7 — Logging: `tauri-plugin-log` (stdout + file + webview) + UI→Rust log bridge (`frontend_log`), console/error forwarding; hardened & instrumented record path
-- [ ] 8 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
-- [ ] 9 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
-- [ ] 10 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
-- [ ] 11 — Playback (`cpal` output + `rtrb` ring buffer), play selection
-- [ ] 12 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
-- [ ] 13 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
-- [ ] 14 — WAV export (`hound`) of selection or whole file
-- [ ] 15 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
-- [ ] 16 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
+- [x] 8 — CI: GitHub Actions (`.github/workflows/ci.yml`) — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on `sf-core` (Ubuntu) and the full workspace (Apple-Silicon macOS)
+- [x] 9 — Build script (`scripts/build.sh`) — one entry point for `check`/`build`/`release`/`app`/`dev`/`clean`, mirroring the CI "everything green" gate locally
+- [ ] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
+- [ ] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
+- [ ] 12 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
+- [ ] 13 — Playback (`cpal` output + `rtrb` ring buffer), play selection
+- [ ] 14 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
+- [ ] 15 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
+- [ ] 16 — WAV export (`hound`) of selection or whole file
+- [ ] 17 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
+- [ ] 18 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
