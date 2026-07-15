@@ -14,9 +14,9 @@
 //! OS crash report.
 
 pub mod audio;
+pub mod cache;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
@@ -30,21 +30,21 @@ fn ping(msg: String) -> String {
     format!("pong: {msg}")
 }
 
-/// A fresh PCM cache path in the app cache directory.
-///
-/// Unique per call by design: [`AudioState::open`] deletes the previous document's cache
-/// when it replaces it, which would clobber the new one if the names collided. The pid keeps
-/// concurrent app instances apart; the counter keeps successive opens apart.
-fn next_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    static N: AtomicU64 = AtomicU64::new(0);
+/// The app cache directory, created if needed. This is where PCM caches live.
+fn cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_cache_dir()
         .map_err(|e| format!("no app cache directory: {e}"))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    Ok(dir.join(format!("pcm-{}-{n}.cache", std::process::id())))
+    Ok(dir)
+}
+
+/// A fresh PCM cache path in the app cache directory. See [`cache::next_path`] for why each
+/// open must get its own.
+fn next_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(cache::next_path(&cache_dir(app)?))
 }
 
 /// Decode `path` into a memory-mapped PCM cache and make it the open document.
@@ -163,6 +163,33 @@ pub fn run() {
             match app.path().app_log_dir() {
                 Ok(dir) => log::info!("log directory: {}", dir.display()),
                 Err(e) => log::warn!("could not resolve log directory: {e}"),
+            }
+
+            // Reclaim PCM caches orphaned by an instance that died without running `Drop`
+            // (SIGKILL, force-quit, panic=abort). These are gigabyte-scale files, so leaving
+            // them would leak disk across crashes.
+            //
+            // This must stay in `setup`, which runs before the webview can invoke `open_file`:
+            // `sweep_at_startup` deletes caches bearing our own pid, which is only sound while
+            // this process has not written any yet. See its docs.
+            match cache_dir(app.handle()) {
+                Ok(dir) => {
+                    let swept =
+                        cache::sweep_at_startup(&dir, std::process::id(), cache::pid_is_live);
+                    if swept.removed > 0 || swept.failed > 0 {
+                        log::info!(
+                            "PCM cache sweep: reaped {} orphan(s), {} bytes; kept {}; {} failed",
+                            swept.removed,
+                            swept.bytes_freed,
+                            swept.kept,
+                            swept.failed
+                        );
+                    } else {
+                        log::debug!("PCM cache sweep: nothing to reap ({} kept)", swept.kept);
+                    }
+                }
+                // Never block startup over cache hygiene.
+                Err(e) => log::warn!("PCM cache sweep skipped: {e}"),
             }
             Ok(())
         })
