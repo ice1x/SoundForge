@@ -29,14 +29,36 @@ scanning only the short unaligned head/tail and stitching O(log N) precomputed b
 so cost is independent of the selection length. The same pyramid feeds the waveform
 view (min/max per pixel). See `crates/sf-core/src/summary.rs`.
 
+The pyramid is built **once per channel when a file is opened** (`Pyramid::build`) and kept
+alongside the memory-mapped PCM in `src-tauri/src/audio.rs`; each query then borrows it via
+`Analyzer::with_pyramid` for free. Measured on a 60 s stereo file (2.88 M frames/channel),
+release build: ~1.2 µs per stats query whether the selection is 1 000 samples or the whole
+file, i.e. a full selection drag costs ~1.2 µs per mouse-move.
+
+## IPC commands
+
+The web UI calls these via `invoke()` (see `src-tauri/src/lib.rs`):
+
+| Command | Args | Returns |
+|---|---|---|
+| `open_file` | `path` | `AudioInfo` — decodes to a PCM cache, builds the pyramids (the only O(n) step) |
+| `audio_info` | — | `AudioInfo` or `null` |
+| `close_file` | — | — (releases the document and deletes its cache) |
+| `stats` | `ch`, `start`, `end` | `StatsDto` — seamless selection statistics, O(log N) |
+| `waveform` | `ch`, `start`, `end`, `bins` | `WaveformDto` — parallel `min`/`max` arrays, one entry per pixel |
+
+Ranges are half-open and clamped to the document; an empty selection yields zeroed stats.
+Values are **linear** — dB formatting stays in the UI (as in the `miniforge.html` prototype),
+which also keeps the JSON free of non-finite floats.
+
 ## Layout
 
 ```
 SoundForge/
 ├─ Cargo.toml            # workspace
 ├─ crates/sf-core/       # pure-Rust analysis core (no GUI / no audio hardware; fully unit-tested)
-├─ src-tauri/            # Tauri binary (depends on sf-core)  — not yet scaffolded
-└─ ui/                   # web UI ported from miniforge.html  — not yet created
+├─ src-tauri/            # Tauri shell (depends on sf-core): IPC commands + audio document state
+└─ ui/                   # web UI ported from miniforge.html
 ```
 
 ## Development
@@ -81,7 +103,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 8 — CI: GitHub Actions (`.github/workflows/ci.yml`) — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on `sf-core` (Ubuntu) and the full workspace (Apple-Silicon macOS)
 - [x] 9 — Build script (`scripts/build.sh`) — one entry point for `check`/`build`/`release`/`app`/`dev`/`clean`, mirroring the CI "everything green" gate locally
 - [x] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
-- [ ] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
+- [x] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
 - [ ] 12 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
 - [ ] 13 — Playback (`cpal` output + `rtrb` ring buffer), play selection
 - [ ] 14 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`

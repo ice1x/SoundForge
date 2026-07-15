@@ -1,5 +1,10 @@
-//! Tauri shell for SoundForge. Owns the window, exposes IPC commands to the web UI,
-//! and (in later tasks) holds the audio engine backed by `sf-core`.
+//! Tauri shell for SoundForge. Owns the window, exposes IPC commands to the web UI, and
+//! holds the audio engine backed by `sf-core`.
+//!
+//! Audio: [`audio::AudioState`] keeps at most one open document — a decoded, memory-mapped
+//! PCM cache plus a per-channel summary pyramid — and answers the [`stats`] and [`waveform`]
+//! commands from it in O(log N), independent of selection length. The commands here are thin
+//! wrappers so that the state logic stays unit-testable without a webview.
 //!
 //! Logging: the `tauri-plugin-log` plugin fans every `log::*` record out to stdout,
 //! a rotating file in the OS log directory, and the webview devtools console. The web
@@ -8,14 +13,106 @@
 //! failures (e.g. `MediaRecorder` being unavailable in WKWebView) that never produce an
 //! OS crash report.
 
-use tauri::Manager;
+pub mod audio;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
+
+use audio::{AudioInfo, AudioState, StatsDto, WaveformDto};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
 /// Returns `"pong: <msg>"`.
 #[tauri::command]
 fn ping(msg: String) -> String {
     format!("pong: {msg}")
+}
+
+/// A fresh PCM cache path in the app cache directory.
+///
+/// Unique per call by design: [`AudioState::open`] deletes the previous document's cache
+/// when it replaces it, which would clobber the new one if the names collided. The pid keeps
+/// concurrent app instances apart; the counter keeps successive opens apart.
+fn next_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("no app cache directory: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    Ok(dir.join(format!("pcm-{}-{n}.cache", std::process::id())))
+}
+
+/// Decode `path` into a memory-mapped PCM cache and make it the open document.
+/// Returns the document geometry; the decode is O(n) and the only slow step.
+#[tauri::command]
+fn open_file(
+    app: tauri::AppHandle,
+    state: State<'_, AudioState>,
+    path: String,
+) -> Result<AudioInfo, String> {
+    let cache = next_cache_path(&app)?;
+    let info = state
+        .open(std::path::Path::new(&path), &cache)
+        .map_err(|e| {
+            log::error!("open_file({path}) failed: {e}");
+            e.to_string()
+        })?;
+    log::info!(
+        "opened {path}: {} ch, {} Hz, {} frames ({:.3} s)",
+        info.channels,
+        info.sample_rate,
+        info.frames,
+        info.duration_s
+    );
+    Ok(info)
+}
+
+/// Geometry of the open document, or `null` if nothing is open.
+#[tauri::command]
+fn audio_info(state: State<'_, AudioState>) -> Option<AudioInfo> {
+    state.info()
+}
+
+/// Close the open document and delete its PCM cache.
+#[tauri::command]
+fn close_file(state: State<'_, AudioState>) {
+    if state.info().is_some() {
+        log::info!("closing document");
+    }
+    state.close();
+}
+
+/// Seamless statistics for the selection `[start, end)` on channel `ch`.
+///
+/// O(log N) in the selection length: this is the command the UI hits on every mouse-move of
+/// a selection drag, so it must never scan the selection.
+#[tauri::command]
+fn stats(
+    state: State<'_, AudioState>,
+    ch: usize,
+    start: usize,
+    end: usize,
+) -> Result<StatsDto, String> {
+    state.stats(ch, start, end).map_err(|e| e.to_string())
+}
+
+/// Min/max envelope of `[start, end)` on channel `ch`, bucketed into `bins` pixels.
+#[tauri::command]
+fn waveform(
+    state: State<'_, AudioState>,
+    ch: usize,
+    start: usize,
+    end: usize,
+    bins: usize,
+) -> Result<WaveformDto, String> {
+    state
+        .waveform(ch, start, end, bins)
+        .map_err(|e| e.to_string())
 }
 
 /// Receive a log line from the web UI and record it through the backend logger, so that
@@ -56,6 +153,7 @@ pub fn run() {
                 ])
                 .build(),
         )
+        .manage(AudioState::default())
         .setup(|app| {
             log::info!(
                 "SoundForge {} starting (debug_assertions={})",
@@ -68,7 +166,15 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ping, frontend_log])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            frontend_log,
+            open_file,
+            audio_info,
+            close_file,
+            stats,
+            waveform
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

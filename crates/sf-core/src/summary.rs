@@ -18,19 +18,28 @@ pub const LEAF: usize = 1024;
 /// Fan-out per pyramid level (each parent block covers `FANOUT` child blocks).
 pub const FANOUT: usize = 8;
 
-/// An analyzer over a borrowed sample buffer with a precomputed summary pyramid.
+/// The precomputed block tree behind an [`Analyzer`], owned independently of it.
 ///
-/// Samples are borrowed, not owned, so the buffer may itself be a memory-mapped file.
-pub struct Analyzer<'a> {
-    samples: &'a [f32],
+/// Building the pyramid is the only O(n) step in analysis; every query afterwards is
+/// O(log N). Splitting it out lets a long-lived caller — e.g. the desktop shell holding a
+/// memory-mapped file open — build one pyramid per channel at load time and then create a
+/// borrowing [`Analyzer`] per query for free, via [`Analyzer::with_pyramid`]. Rebuilding it
+/// per query instead would make every selection drag O(n) and defeat the whole design.
+///
+/// [`Analyzer::new`] builds and owns one internally, which is what short-lived, one-shot
+/// analyses want.
+pub struct Pyramid {
     /// `levels[0]` = one `Agg` per leaf block (`LEAF` samples each).
     /// `levels[k][j]` covers `FANOUT^k` leaf blocks starting at leaf `j*FANOUT^k`.
     levels: Vec<Vec<Agg>>,
+    /// Number of samples this pyramid was built over. Kept so [`Analyzer::with_pyramid`]
+    /// can reject a pyramid that does not match its buffer.
+    n_samples: usize,
 }
 
-impl<'a> Analyzer<'a> {
+impl Pyramid {
     /// Build the summary pyramid over `samples`. O(n) time, O(n / (FANOUT-1)) extra space.
-    pub fn new(samples: &'a [f32]) -> Self {
+    pub fn build(samples: &[f32]) -> Self {
         let mut levels: Vec<Vec<Agg>> = Vec::new();
 
         // Leaf level: fold each LEAF-sized chunk.
@@ -64,7 +73,82 @@ impl<'a> Analyzer<'a> {
             levels.push(parent);
         }
 
-        Analyzer { samples, levels }
+        Pyramid {
+            levels,
+            n_samples: samples.len(),
+        }
+    }
+
+    /// Number of samples this pyramid was built over.
+    pub fn len(&self) -> usize {
+        self.n_samples
+    }
+
+    /// True if this pyramid was built over an empty buffer.
+    pub fn is_empty(&self) -> bool {
+        self.n_samples == 0
+    }
+}
+
+/// A pyramid an [`Analyzer`] either owns or borrows from a longer-lived cache.
+enum PyramidRef<'a> {
+    Owned(Pyramid),
+    Borrowed(&'a Pyramid),
+}
+
+impl PyramidRef<'_> {
+    #[inline]
+    fn levels(&self) -> &[Vec<Agg>] {
+        match self {
+            PyramidRef::Owned(p) => &p.levels,
+            PyramidRef::Borrowed(p) => &p.levels,
+        }
+    }
+}
+
+/// An analyzer over a borrowed sample buffer with a precomputed summary pyramid.
+///
+/// Samples are borrowed, not owned, so the buffer may itself be a memory-mapped file.
+pub struct Analyzer<'a> {
+    samples: &'a [f32],
+    pyramid: PyramidRef<'a>,
+}
+
+impl<'a> Analyzer<'a> {
+    /// Build the summary pyramid over `samples` and own it. O(n) time.
+    ///
+    /// Use [`Self::with_pyramid`] instead when the same buffer is queried repeatedly, so the
+    /// O(n) build happens once rather than per query.
+    pub fn new(samples: &'a [f32]) -> Self {
+        Analyzer {
+            samples,
+            pyramid: PyramidRef::Owned(Pyramid::build(samples)),
+        }
+    }
+
+    /// Analyze `samples` using a pyramid already built over *those same samples*.
+    /// O(1) — no pyramid work at all, so this is cheap enough to call per query.
+    ///
+    /// # Panics
+    /// Panics if `pyramid` was not built over a buffer of the same length as `samples`.
+    /// Checking here is what turns a stale pyramid — e.g. one kept across an edit that
+    /// resized the buffer — into an immediate, named error instead of an opaque
+    /// out-of-bounds index deep inside a range query. A pyramid of the right length but
+    /// stale *contents* cannot be detected and will silently return wrong statistics, so
+    /// rebuild it whenever the samples change.
+    pub fn with_pyramid(samples: &'a [f32], pyramid: &'a Pyramid) -> Self {
+        assert_eq!(
+            pyramid.n_samples,
+            samples.len(),
+            "pyramid was built over {} samples but the buffer has {} — rebuild it after \
+             the buffer is resized",
+            pyramid.n_samples,
+            samples.len()
+        );
+        Analyzer {
+            samples,
+            pyramid: PyramidRef::Borrowed(pyramid),
+        }
     }
 
     /// Total number of samples.
@@ -133,6 +217,7 @@ impl<'a> Analyzer<'a> {
     /// pyramid blocks that fit, greedily. Every block used is composed entirely of full
     /// leaves, so its precomputed `Agg` is exact for the samples it represents.
     fn combine_aligned(&self, mut acc: Agg, start_leaf: usize, end_leaf: usize) -> Agg {
+        let levels = self.pyramid.levels();
         let mut i = start_leaf;
         while i < end_leaf {
             // Grow the level as long as the block stays aligned and fits within end_leaf.
@@ -140,10 +225,10 @@ impl<'a> Analyzer<'a> {
             loop {
                 let next = level + 1;
                 let span_next = FANOUT.pow(next as u32);
-                if next < self.levels.len()
+                if next < levels.len()
                     && i.is_multiple_of(span_next)
                     && i + span_next <= end_leaf
-                    && (i / span_next) < self.levels[next].len()
+                    && (i / span_next) < levels[next].len()
                 {
                     level = next;
                 } else {
@@ -151,7 +236,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             let span = FANOUT.pow(level as u32);
-            acc = acc.combine(&self.levels[level][i / span]);
+            acc = acc.combine(&levels[level][i / span]);
             i += span;
         }
         acc
@@ -312,6 +397,63 @@ mod tests {
                 .count()
                 <= 3
         );
+    }
+
+    #[test]
+    fn with_pyramid_matches_owned_analyzer() {
+        let mut rng = Rng(0x5EED_1234_ABCD_9876);
+        // Sizes spanning partial leaves, exact leaves, and several pyramid levels.
+        for &len in &[1usize, LEAF - 1, LEAF, LEAF + 1, 9_999, 60_000] {
+            let samples: Vec<f32> = (0..len).map(|_| rng.next_f32()).collect();
+            let owned = Analyzer::new(&samples);
+            let pyramid = Pyramid::build(&samples);
+            let borrowed = Analyzer::with_pyramid(&samples, &pyramid);
+
+            for _ in 0..50 {
+                let a = rng.below(len);
+                let b = rng.below(len);
+                let (s, e) = (a.min(b), a.max(b) + 1);
+                assert_agg_eq(&borrowed.range(s, e), &owned.range(s, e));
+            }
+            assert_eq!(borrowed.waveform(0, len, 64), owned.waveform(0, len, 64));
+            assert_eq!(borrowed.len(), owned.len());
+        }
+    }
+
+    #[test]
+    fn mismatched_pyramid_is_rejected_at_construction() {
+        // A stale pyramid (e.g. kept across an edit that resized the buffer) used to index
+        // out of bounds deep inside `range`; it must fail loudly and immediately instead.
+        let short = vec![0.5f32; 100];
+        let long = vec![0.5f32; 10_000];
+        let pyramid = Pyramid::build(&short);
+        assert_eq!(pyramid.len(), 100);
+
+        let err = std::panic::catch_unwind(|| Analyzer::with_pyramid(&long, &pyramid))
+            .err()
+            .expect("a pyramid of the wrong length must be rejected");
+        let msg = err
+            .downcast_ref::<String>()
+            .expect("panic payload should be a string");
+        assert!(
+            msg.contains("100") && msg.contains("10000"),
+            "message: {msg}"
+        );
+
+        // The matching buffer is of course still accepted.
+        assert_eq!(Analyzer::with_pyramid(&short, &pyramid).len(), 100);
+    }
+
+    #[test]
+    fn one_pyramid_serves_many_analyzers() {
+        // The point of the split: build once, query through many short-lived analyzers.
+        let samples: Vec<f32> = (0..20_000).map(|i| ((i as f32) * 0.003).sin()).collect();
+        let pyramid = Pyramid::build(&samples);
+        let want = naive(&samples, 100, 19_000);
+        for _ in 0..5 {
+            let az = Analyzer::with_pyramid(&samples, &pyramid);
+            assert_agg_eq(&az.range(100, 19_000), &want);
+        }
     }
 
     #[test]

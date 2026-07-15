@@ -3075,6 +3075,7 @@ dependencies = [
 name = "soundforge"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "log",
  "serde",
  "serde_json",
