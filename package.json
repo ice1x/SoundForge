@@ -1,0 +1,9 @@
+{
+  "name": "soundforge-ui",
+  "private": true,
+  "type": "module",
+  "description": "Test harness for the SoundForge web UI (ui/). No build step and no runtime dependencies: the UI ships as plain ES modules and is tested with the Node built-in test runner.",
+  "scripts": {
+    "test": "node --test \"tests/ui/**/*.test.js\""
+  }
+}

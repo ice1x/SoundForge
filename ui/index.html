@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MiniForge — редактор со статистикой из коробки</title>
+<title>SoundForge — редактор со статистикой из коробки</title>
 <style>
   :root{
     --bg:#0b0d10;
@@ -12,7 +12,7 @@
     --line:#232b33;
     --ink:#e7ece9;
     --dim:#7d8a92;
-    --amber:#ffb454;      /* сигнал / волна */
+    --amber:#ffb454;      /* signal / waveform */
     --amber-soft:#8a5a1f;
     --sel:rgba(255,180,84,0.14);
     --green:#57d9a3;
@@ -40,19 +40,28 @@
     background:var(--panel-2);border:1px solid var(--line);border-radius:6px;
     padding:7px 11px;cursor:pointer;transition:.12s;white-space:nowrap;
   }
-  button:hover{border-color:#33404a;background:#1c232a}
-  button:active{transform:translateY(1px)}
+  button:hover:not(:disabled){border-color:#33404a;background:#1c232a}
+  button:active:not(:disabled){transform:translateY(1px)}
   button:disabled{opacity:.4;cursor:not-allowed}
   button.primary{border-color:var(--amber-soft);color:var(--amber)}
   button.rec{border-color:#5a2020;color:var(--red)}
-  button.rec.on{background:var(--red);color:#fff;border-color:var(--red)}
+  /* Error banner: replaces the prototype's alert() so a failure never blocks the UI. */
+  .errbar{
+    display:none;padding:8px 16px;background:#2a1416;border-bottom:1px solid #5a2020;
+    color:var(--red);font-family:var(--mono);font-size:11px;
+  }
+  .errbar.on{display:block}
   .main{flex:1;display:flex;min-height:0}
   .left{flex:1;display:flex;flex-direction:column;min-width:0;padding:14px;gap:10px}
   .wavewrap{
     position:relative;flex:1;background:var(--panel);border:1px solid var(--line);
     border-radius:8px;overflow:hidden;min-height:180px;
   }
-  canvas{display:block;width:100%;height:100%}
+  /* Two stacked canvases: the envelope is expensive to build and only changes on
+     zoom/scroll/resize, while the selection overlay repaints on every drag frame.
+     Keeping them separate is what lets a drag stay at 60 fps. */
+  canvas{position:absolute;inset:0;display:block;width:100%;height:100%}
+  #overlay{cursor:text}
   .drop-hint{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     flex-direction:column;gap:8px;color:var(--dim);text-align:center;pointer-events:none;
@@ -60,7 +69,7 @@
   .drop-hint b{color:var(--ink)}
   .transport{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .transport .time{font-family:var(--mono);color:var(--dim);font-size:12px;margin-left:6px}
-  .edits{display:flex;gap:6px;flex-wrap:wrap;padding-top:2px;border-top:1px solid var(--line);padding-top:10px}
+  .edits{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}
   .right{
     width:300px;border-left:1px solid var(--line);background:var(--panel);
     display:flex;flex-direction:column;
@@ -73,6 +82,15 @@
   .stat-head .live{color:var(--green);font-size:10px}
   .stat-head .live::before{content:"●";margin-right:5px;animation:pulse 1.6s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .chrow{
+    display:flex;align-items:center;gap:8px;padding:8px 16px;
+    border-bottom:1px solid var(--line);color:var(--dim);font-size:12px;
+  }
+  select{
+    flex:1;font-family:var(--sans);font-size:12px;color:var(--ink);
+    background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:5px 8px;
+  }
+  select:disabled{opacity:.4}
   .stats{padding:6px 0;overflow:auto;flex:1}
   .row{
     display:flex;justify-content:space-between;align-items:baseline;
@@ -84,53 +102,62 @@
   .row.hi .v{color:var(--amber)}
   .row .u{color:var(--dim);font-size:11px;margin-left:3px}
   .scope-note{padding:10px 16px;color:var(--dim);font-size:11px;border-top:1px solid var(--line);line-height:1.5}
-  input[type=file]{display:none}
   .kbd{font-family:var(--mono);font-size:10px;color:var(--dim)}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo"><b>Mini</b>Forge</div>
+  <div class="logo"><b>Sound</b>Forge</div>
   <div class="meta" id="fileMeta">нет файла</div>
   <div class="spacer"></div>
   <div class="toolbar">
-    <button onclick="document.getElementById('fileInput').click()">Открыть файл…</button>
-    <button id="recBtn" class="rec" onclick="toggleRecord()">● Запись</button>
-    <button id="saveBtn" class="primary" onclick="exportWav()" disabled>Сохранить WAV</button>
+    <button id="openBtn">Открыть файл…</button>
+    <button id="closeBtn" disabled>Закрыть</button>
+    <!-- Playback, recording, edits and export are backend features still to come; the
+         controls are shown disabled so the layout matches the target design. Deliberately
+         no task numbers here: the README renumbers tasks whenever one is inserted. -->
+    <button id="recBtn" class="rec" disabled title="Нативная запись — пока не реализована">● Запись</button>
+    <button id="saveBtn" class="primary" disabled title="Экспорт WAV — пока не реализован">Сохранить WAV</button>
   </div>
-  <input type="file" id="fileInput" accept="audio/*" onchange="loadFile(this.files[0])">
 </header>
+
+<div class="errbar" id="errBar"></div>
 
 <div class="main">
   <div class="left">
     <div class="wavewrap" id="wavewrap">
       <canvas id="wave"></canvas>
+      <canvas id="overlay"></canvas>
       <div class="drop-hint" id="hint">
         <b>Перетащи сюда аудиофайл</b>
-        <span>или нажми «Открыть файл…» / «Запись»</span>
+        <span>или нажми «Открыть файл…»</span>
         <span class="kbd">выдели мышкой участок → статистика справа считается сама</span>
+        <span class="kbd">колесо — масштаб, shift+колесо — прокрутка</span>
       </div>
     </div>
 
     <div class="transport">
-      <button id="playBtn" onclick="togglePlay()" disabled>▶ Играть</button>
-      <button onclick="selectAll()" disabled id="selAllBtn">Выделить всё</button>
-      <button onclick="clearSel()" disabled id="clrSelBtn">Снять выделение</button>
+      <button id="playBtn" disabled title="Играть выделение (или весь файл) — пробел">▶ Играть</button>
+      <button id="selAllBtn" disabled>Выделить всё</button>
+      <button id="clrSelBtn" disabled>Снять выделение</button>
+      <button id="fitBtn" disabled>Весь файл</button>
+      <button id="zoomSelBtn" disabled>Масштаб по выделению</button>
       <span class="time" id="timeReadout">—</span>
     </div>
 
     <div class="edits">
-      <button onclick="doEdit('normalize')" disabled class="ed">Нормализовать</button>
-      <button onclick="doEdit('fadein')" disabled class="ed">Fade In</button>
-      <button onclick="doEdit('fadeout')" disabled class="ed">Fade Out</button>
-      <button onclick="doEdit('silence')" disabled class="ed">Тишина</button>
-      <button onclick="doEdit('trim')" disabled class="ed">Обрезать до выделения</button>
-      <button onclick="undo()" disabled id="undoBtn">↶ Отменить</button>
+      <button disabled class="ed" title="Правки — пока не реализованы">Нормализовать</button>
+      <button disabled class="ed" title="Правки — пока не реализованы">Fade In</button>
+      <button disabled class="ed" title="Правки — пока не реализованы">Fade Out</button>
+      <button disabled class="ed" title="Правки — пока не реализованы">Тишина</button>
+      <button disabled class="ed" title="Правки — пока не реализованы">Обрезать до выделения</button>
+      <button disabled id="undoBtn" title="Отмена правок — пока не реализована">↶ Отменить</button>
     </div>
   </div>
 
   <div class="right">
     <div class="stat-head"><span>Statistics</span><span class="live">live</span></div>
+    <div class="chrow"><span>Канал</span><select id="chSel" disabled></select></div>
     <div class="stats" id="statsBody">
       <div class="row"><span class="k">Загрузи звук, чтобы увидеть цифры</span></div>
     </div>
@@ -138,387 +165,6 @@
   </div>
 </div>
 
-<script>
-"use strict";
-
-// ---------- logging bridge ----------
-// Forward all UI diagnostics (console output + uncaught errors) to the Rust logger via
-// the `frontend_log` IPC command, so webview-only failures show up in the log file.
-// Falls back to a no-op bridge when running outside Tauri (e.g. opening this file in a
-// plain browser), so the page still works standalone.
-const __TAURI = window.__TAURI__;
-function __invoke(cmd, args){
-  try {
-    if (__TAURI && __TAURI.core && typeof __TAURI.core.invoke === 'function') {
-      return __TAURI.core.invoke(cmd, args);
-    }
-  } catch(_) { /* ignore bridge errors */ }
-  return undefined;
-}
-function sflog(level, ...args){
-  const msg = args.map(a => {
-    if (a instanceof Error) return (a.stack || (a.name + ': ' + a.message));
-    if (a && typeof a === 'object') { try { return JSON.stringify(a); } catch(_) { return String(a); } }
-    return String(a);
-  }).join(' ');
-  __invoke('frontend_log', { level, message: msg });
-}
-// Mirror console.* to the backend while keeping normal console behaviour.
-['log','info','warn','error','debug'].forEach(k => {
-  const orig = console[k] ? console[k].bind(console) : function(){};
-  console[k] = (...a) => { orig(...a); sflog(k === 'log' ? 'info' : k, ...a); };
-});
-window.addEventListener('error', e => {
-  sflog('error', 'window.onerror:', e.message, 'at', (e.filename||'?')+':'+(e.lineno||'?')+':'+(e.colno||'?'), e.error||'');
-});
-window.addEventListener('unhandledrejection', e => {
-  sflog('error', 'unhandledrejection:', e.reason||'(no reason)');
-});
-sflog('info', 'UI booted. tauri=' + !!__TAURI
-  + ' MediaRecorder=' + (typeof MediaRecorder !== 'undefined')
-  + ' getUserMedia=' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
-  + ' AudioContext=' + !!(window.AudioContext || window.webkitAudioContext));
-
-// ---------- состояние ----------
-let ctx = null;            // AudioContext
-let sampleRate = 44100;
-let data = null;           // Float32Array (моно) — рабочие сэмплы
-let selStart = 0, selEnd = 0;   // индексы сэмплов выделения (== => нет выделения)
-let source = null;         // текущий playback source
-let playing = false;
-let undoStack = [];
-const MAX_UNDO = 20;
-
-// запись
-let mediaStream = null, recorder = null, recChunks = [];
-let recording = false;
-
-const canvas = document.getElementById('wave');
-const cctx = canvas.getContext('2d');
-
-function ensureCtx(){ if(!ctx){ ctx = new (window.AudioContext||window.webkitAudioContext)(); } return ctx; }
-
-// ---------- загрузка ----------
-async function loadFile(file){
-  if(!file) return;
-  ensureCtx();
-  const buf = await file.arrayBuffer();
-  let decoded;
-  try { decoded = await ctx.decodeAudioData(buf); }
-  catch(e){ alert("Не удалось прочитать файл: "+e.message); return; }
-  ingestBuffer(decoded);
-  setMeta(file.name, decoded);
-}
-
-function ingestBuffer(decoded){
-  sampleRate = decoded.sampleRate;
-  // downmix в моно
-  const n = decoded.length, chs = decoded.numberOfChannels;
-  const mono = new Float32Array(n);
-  for(let c=0;c<chs;c++){
-    const ch = decoded.getChannelData(c);
-    for(let i=0;i<n;i++) mono[i]+=ch[i]/chs;
-  }
-  data = mono; undoStack = [];
-  selStart = selEnd = 0;
-  enableAll();
-  drawWave(); computeStats();
-  document.getElementById('hint').style.display='none';
-}
-
-function setMeta(name, decoded){
-  const dur = (data.length/sampleRate);
-  document.getElementById('fileMeta').textContent =
-    `${name||'запись'} · ${sampleRate} Hz · моно · ${dur.toFixed(3)} s`;
-}
-
-function enableAll(){
-  ['playBtn','saveBtn','selAllBtn','clrSelBtn'].forEach(id=>document.getElementById(id).disabled=false);
-  document.querySelectorAll('.ed').forEach(b=>b.disabled=false);
-  updateUndo();
-}
-
-// ---------- запись ----------
-// NOTE: browser recording (getUserMedia + MediaRecorder) is a placeholder. WKWebView —
-// which Tauri uses on macOS — historically does NOT implement MediaRecorder, so this path
-// is feature-detected and fails loudly (with a log line) instead of crashing the UI with
-// an uncaught exception. Native recording via cpal is tracked as task 11 in README.md.
-async function toggleRecord(){
-  const btn = document.getElementById('recBtn');
-  if(!recording){
-    sflog('info', 'record: start requested');
-
-    // Feature-detection: bail out cleanly if the webview lacks the required APIs.
-    if(!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){
-      sflog('error', 'record: getUserMedia unavailable in this webview');
-      alert("Запись недоступна: getUserMedia не поддерживается этим webview.\nБудет реализована нативно (cpal) — задача 11.");
-      return;
-    }
-    if(typeof MediaRecorder === 'undefined'){
-      sflog('error', 'record: MediaRecorder unavailable in this webview (expected on macOS WKWebView)');
-      alert("Запись недоступна: MediaRecorder не поддерживается этим webview (ожидаемо на macOS WKWebView).\nБудет реализована нативно (cpal) — задача 11.");
-      return;
-    }
-
-    try{
-      mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
-      sflog('info', 'record: microphone stream acquired');
-    }catch(e){
-      sflog('error', 'record: getUserMedia failed:', e);
-      alert("Нет доступа к микрофону: "+e.message);
-      return;
-    }
-
-    try{
-      ensureCtx();
-      recChunks = [];
-      recorder = new MediaRecorder(mediaStream);
-      sflog('info', 'record: MediaRecorder created, mimeType=' + (recorder.mimeType||'?'));
-      recorder.ondataavailable = e=>{ if(e.data.size) recChunks.push(e.data); };
-      recorder.onerror = e=>{ sflog('error', 'record: MediaRecorder error:', e.error||e); };
-      recorder.onstop = async ()=>{
-        try{
-          const blob = new Blob(recChunks, {type: recorder.mimeType||'audio/webm'});
-          const arr = await blob.arrayBuffer();
-          const decoded = await ctx.decodeAudioData(arr);
-          ingestBuffer(decoded);
-          setMeta('запись', decoded);
-          sflog('info', 'record: decoded '+decoded.length+' frames @ '+decoded.sampleRate+'Hz');
-        }catch(e){
-          sflog('error', 'record: decode failed:', e);
-          alert("Не удалось декодировать запись: "+e.message);
-        }finally{
-          if(mediaStream) mediaStream.getTracks().forEach(t=>t.stop());
-        }
-      };
-      recorder.start();
-      recording = true;
-      btn.classList.add('on'); btn.textContent='■ Стоп';
-    }catch(e){
-      // MediaRecorder construction / start can throw synchronously in WKWebView.
-      sflog('error', 'record: failed to start recorder:', e);
-      alert("Не удалось запустить запись: "+e.message);
-      if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
-      recording = false;
-      btn.classList.remove('on'); btn.textContent='● Запись';
-    }
-  } else {
-    try{ recorder && recorder.stop(); }
-    catch(e){ sflog('error', 'record: stop failed:', e); }
-    recording = false;
-    btn.classList.remove('on'); btn.textContent='● Запись';
-    sflog('info', 'record: stopped');
-  }
-}
-
-// ---------- отрисовка волны ----------
-function fitCanvas(){
-  const r = canvas.parentElement.getBoundingClientRect();
-  const dpr = window.devicePixelRatio||1;
-  canvas.width = r.width*dpr; canvas.height = r.height*dpr;
-  cctx.setTransform(dpr,0,0,dpr,0,0);
-  return {w:r.width,h:r.height};
-}
-
-function drawWave(){
-  const {w,h} = fitCanvas();
-  cctx.clearRect(0,0,w,h);
-  if(!data){ return; }
-  const mid = h/2;
-  // выделение
-  if(selEnd>selStart){
-    const x1 = selStart/data.length*w, x2 = selEnd/data.length*w;
-    cctx.fillStyle = getCss('--sel');
-    cctx.fillRect(x1,0,x2-x1,h);
-  }
-  // центральная линия
-  cctx.strokeStyle = getCss('--line'); cctx.lineWidth=1;
-  cctx.beginPath(); cctx.moveTo(0,mid); cctx.lineTo(w,mid); cctx.stroke();
-  // волна (min/max на пиксель)
-  cctx.strokeStyle = getCss('--amber'); cctx.lineWidth=1;
-  cctx.beginPath();
-  const step = data.length/w;
-  for(let x=0;x<w;x++){
-    let min=1,max=-1;
-    const s=Math.floor(x*step), e=Math.min(data.length,Math.floor((x+1)*step));
-    for(let i=s;i<e;i++){ const v=data[i]; if(v<min)min=v; if(v>max)max=v; }
-    if(s>=e){ min=max=data[Math.min(data.length-1,s)]||0; }
-    cctx.moveTo(x, mid - max*mid*0.95);
-    cctx.lineTo(x, mid - min*mid*0.95);
-  }
-  cctx.stroke();
-}
-
-function getCss(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-
-// ---------- выделение мышкой ----------
-let dragging=false;
-canvas.addEventListener('mousedown', e=>{
-  if(!data) return;
-  dragging=true;
-  const x = e.offsetX/canvas.parentElement.clientWidth;
-  selStart = Math.round(clamp(x,0,1)*data.length);
-  selEnd = selStart;
-  drawWave(); computeStats();
-});
-window.addEventListener('mousemove', e=>{
-  if(!dragging||!data) return;
-  const rect = canvas.parentElement.getBoundingClientRect();
-  const x = (e.clientX-rect.left)/rect.width;
-  const cur = Math.round(clamp(x,0,1)*data.length);
-  if(cur>=selStart) selEnd=cur; else { selEnd=selStart; selStart=cur; }
-  drawWave(); computeStats();
-});
-window.addEventListener('mouseup', ()=>{ dragging=false; });
-function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
-
-function selectAll(){ selStart=0; selEnd=data.length; drawWave(); computeStats(); }
-function clearSel(){ selStart=selEnd=0; drawWave(); computeStats(); }
-
-// ---------- СТАТИСТИКА (без кнопок, считается сама) ----------
-function computeStats(){
-  if(!data){ return; }
-  const s = selEnd>selStart ? selStart : 0;
-  const e = selEnd>selStart ? selEnd : data.length;
-  const N = e-s;
-  const durSec = N/sampleRate;
-
-  let peak=0, minV=Infinity, maxV=-Infinity, minPos=s, maxPos=s;
-  let sum=0, sumSq=0, zc=0;
-  let prevSign = 0;
-  for(let i=s;i<e;i++){
-    const v = data[i];
-    const a = Math.abs(v);
-    if(a>peak) peak=a;
-    if(v<minV){ minV=v; minPos=i; }
-    if(v>maxV){ maxV=v; maxPos=i; }
-    sum += v; sumSq += v*v;
-    const sign = v>0?1:(v<0?-1:0);
-    if(sign!==0){ if(prevSign!==0 && sign!==prevSign) zc++; prevSign=sign; }
-  }
-  const rms = Math.sqrt(sumSq/N);
-  const avg = sum/N;                          // DC offset (linear)
-  const freq = durSec>0 ? zc/(2*durSec) : 0;  // zero-crossing frequency (sine convention)
-
-  const rows = [
-    ['Длина выделения', fmtTime(durSec), '', false],
-    ['Сэмплов', N.toLocaleString('ru-RU'), '', false],
-    ['Позиция начала', fmtTime(s/sampleRate), '', false],
-    ['Пик (Peak)', db(peak), 'dB', true],
-    ['Макс. сэмпл', db(Math.abs(maxV)), 'dB', false],
-    ['Позиция макс.', fmtTime(maxPos/sampleRate), '', false],
-    ['Мин. сэмпл', db(Math.abs(minV)), 'dB', false],
-    ['Позиция мин.', fmtTime(minPos/sampleRate), '', false],
-    ['RMS', db(rms), 'dB', true],
-    ['Среднее (DC offset)', avg.toFixed(6), '', false],
-    ['DC offset', db(Math.abs(avg)), 'dB', false],
-    ['Пересечения нуля', zc.toLocaleString('ru-RU'), '', false],
-    ['Частота (zero-cross)', freq.toFixed(1), 'Hz', true],
-  ];
-
-  document.getElementById('statsBody').innerHTML = rows.map(([k,v,u,hi])=>
-    `<div class="row${hi?' hi':''}"><span class="k">${k}</span>`+
-    `<span class="v">${v}${u?`<span class="u">${u}</span>`:''}</span></div>`
-  ).join('');
-
-  document.getElementById('scopeNote').textContent =
-    selEnd>selStart ? `Область: выделение ${fmtTime(s/sampleRate)} – ${fmtTime(e/sampleRate)}`
-                    : `Область: весь файл (выдели участок мышкой для локальной статистики)`;
-  document.getElementById('timeReadout').textContent =
-    selEnd>selStart ? `${fmtTime(s/sampleRate)} → ${fmtTime(e/sampleRate)}  (${fmtTime(durSec)})`
-                    : `весь файл · ${fmtTime(durSec)}`;
-}
-
-function db(x){ if(x<=0) return '-∞'; const d=20*Math.log10(x); return (d>0?'+':'')+d.toFixed(2); }
-function fmtTime(sec){
-  if(!isFinite(sec)) return '—';
-  const m=Math.floor(sec/60), s=sec-m*60;
-  return (m>0? m+':' : '') + (m>0? s.toFixed(3).padStart(6,'0') : s.toFixed(3)) + (m>0?'':' s');
-}
-
-// ---------- воспроизведение ----------
-function togglePlay(){
-  if(playing){ stopPlay(); return; }
-  ensureCtx();
-  const s = selEnd>selStart ? selStart : 0;
-  const e = selEnd>selStart ? selEnd : data.length;
-  const buf = ctx.createBuffer(1, e-s, sampleRate);
-  buf.getChannelData(0).set(data.subarray(s,e));
-  source = ctx.createBufferSource();
-  source.buffer = buf; source.connect(ctx.destination);
-  source.onended = ()=>{ if(playing) stopPlay(); };
-  source.start();
-  playing=true; document.getElementById('playBtn').textContent='■ Стоп';
-}
-function stopPlay(){
-  if(source){ try{source.stop();}catch(e){} source=null; }
-  playing=false; document.getElementById('playBtn').textContent='▶ Играть';
-}
-
-// ---------- редактирование ----------
-function pushUndo(){ undoStack.push(data.slice()); if(undoStack.length>MAX_UNDO) undoStack.shift(); updateUndo(); }
-function updateUndo(){ document.getElementById('undoBtn').disabled = undoStack.length===0; }
-function undo(){ if(!undoStack.length) return; data = undoStack.pop(); if(selEnd>data.length){selStart=selEnd=0;} updateUndo(); drawWave(); computeStats(); }
-
-function doEdit(kind){
-  if(!data) return;
-  const hasSel = selEnd>selStart;
-  const s = hasSel?selStart:0, e = hasSel?selEnd:data.length;
-  pushUndo();
-  if(kind==='normalize'){
-    let peak=0; for(let i=s;i<e;i++){const a=Math.abs(data[i]); if(a>peak)peak=a;}
-    if(peak>0){ const g=0.999/peak; for(let i=s;i<e;i++) data[i]*=g; }
-  } else if(kind==='fadein'){
-    const L=e-s; for(let i=s;i<e;i++) data[i]*=(i-s)/L;
-  } else if(kind==='fadeout'){
-    const L=e-s; for(let i=s;i<e;i++) data[i]*=1-(i-s)/L;
-  } else if(kind==='silence'){
-    for(let i=s;i<e;i++) data[i]=0;
-  } else if(kind==='trim'){
-    if(!hasSel){ undoStack.pop(); updateUndo(); return; }
-    data = data.slice(s,e); selStart=selEnd=0;
-  }
-  drawWave(); computeStats();
-}
-
-// ---------- экспорт WAV ----------
-function exportWav(){
-  if(!data) return;
-  const hasSel = selEnd>selStart;
-  const s = hasSel?selStart:0, e = hasSel?selEnd:data.length;
-  const seg = data.subarray(s,e);
-  const wav = encodeWav(seg, sampleRate);
-  const url = URL.createObjectURL(new Blob([wav],{type:'audio/wav'}));
-  const a = document.createElement('a');
-  a.href=url; a.download='miniforge_export.wav'; a.click();
-  setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-function encodeWav(samples, sr){
-  const n=samples.length, buf=new ArrayBuffer(44+n*2), dv=new DataView(buf);
-  const wr=(o,str)=>{for(let i=0;i<str.length;i++)dv.setUint8(o+i,str.charCodeAt(i));};
-  wr(0,'RIFF'); dv.setUint32(4,36+n*2,true); wr(8,'WAVE'); wr(12,'fmt ');
-  dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
-  dv.setUint32(24,sr,true); dv.setUint32(28,sr*2,true); dv.setUint16(32,2,true);
-  dv.setUint16(34,16,true); wr(36,'data'); dv.setUint32(40,n*2,true);
-  let o=44; for(let i=0;i<n;i++){ let v=Math.max(-1,Math.min(1,samples[i])); dv.setInt16(o,v<0?v*0x8000:v*0x7FFF,true); o+=2; }
-  return buf;
-}
-
-// ---------- drag & drop ----------
-const wrap = document.getElementById('wavewrap');
-['dragover','dragenter'].forEach(ev=>wrap.addEventListener(ev,e=>{e.preventDefault();wrap.style.borderColor=getCss('--amber');}));
-['dragleave','drop'].forEach(ev=>wrap.addEventListener(ev,e=>{e.preventDefault();wrap.style.borderColor=getCss('--line');}));
-wrap.addEventListener('drop', e=>{ const f=e.dataTransfer.files[0]; if(f) loadFile(f); });
-
-// ---------- keyboard ----------
-window.addEventListener('keydown', e=>{
-  if(e.code==='Space' && data){ e.preventDefault(); togglePlay(); }
-  if((e.metaKey||e.ctrlKey) && e.key==='z'){ e.preventDefault(); undo(); }
-  if((e.metaKey||e.ctrlKey) && e.key==='a' && data){ e.preventDefault(); selectAll(); }
-});
-
-window.addEventListener('resize', ()=>{ if(data) drawWave(); });
-fitCanvas();
-</script>
+<script type="module" src="./app.js"></script>
 </body>
 </html>

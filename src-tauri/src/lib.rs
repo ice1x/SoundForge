@@ -1,5 +1,15 @@
-//! Tauri shell for SoundForge. Owns the window, exposes IPC commands to the web UI,
-//! and (in later tasks) holds the audio engine backed by `sf-core`.
+//! Tauri shell for SoundForge. Owns the window, exposes IPC commands to the web UI, and
+//! holds the audio engine backed by `sf-core`.
+//!
+//! Audio: [`audio::AudioState`] keeps at most one open document — a decoded, memory-mapped
+//! PCM cache plus a per-channel summary pyramid — and answers the [`stats`] and [`waveform`]
+//! commands from it in O(log N), independent of selection length. The commands here are thin
+//! wrappers so that the state logic stays unit-testable without a webview.
+//!
+//! Playback: [`player::Player`] streams a range of that same PCM to the default output
+//! device (task 14). It shares the document's samples by `Arc` rather than reading them
+//! through [`audio::AudioState`], so the audio path never contends with a selection drag for
+//! the document lock.
 //!
 //! Logging: the `tauri-plugin-log` plugin fans every `log::*` record out to stdout,
 //! a rotating file in the OS log directory, and the webview devtools console. The web
@@ -8,14 +18,164 @@
 //! failures (e.g. `MediaRecorder` being unavailable in WKWebView) that never produce an
 //! OS crash report.
 
-use tauri::Manager;
+pub mod audio;
+pub mod cache;
+pub mod player;
+
+use std::path::PathBuf;
+
+use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
+
+use audio::{AudioInfo, AudioState, StatsDto, WaveformDto};
+use player::{PlaybackDto, Player};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
 /// Returns `"pong: <msg>"`.
 #[tauri::command]
 fn ping(msg: String) -> String {
     format!("pong: {msg}")
+}
+
+/// The app cache directory, created if needed. This is where PCM caches live.
+fn cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("no app cache directory: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// A fresh PCM cache path in the app cache directory. See [`cache::next_path`] for why each
+/// open must get its own.
+fn next_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(cache::next_path(&cache_dir(app)?))
+}
+
+/// Decode `path` into a memory-mapped PCM cache and make it the open document.
+/// Returns the document geometry; the decode is O(n) and the only slow step.
+#[tauri::command]
+fn open_file(
+    app: tauri::AppHandle,
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    path: String,
+) -> Result<AudioInfo, String> {
+    // Whatever is playing belongs to the outgoing document. Stopping first also releases the
+    // device before the (slow) decode, rather than leaving a stream running through it.
+    player.stop();
+    let cache = next_cache_path(&app)?;
+    let info = state
+        .open(std::path::Path::new(&path), &cache)
+        .map_err(|e| {
+            log::error!("open_file({path}) failed: {e}");
+            e.to_string()
+        })?;
+    log::info!(
+        "opened {path}: {} ch, {} Hz, {} frames ({:.3} s)",
+        info.channels,
+        info.sample_rate,
+        info.frames,
+        info.duration_s
+    );
+    Ok(info)
+}
+
+/// Geometry of the open document, or `null` if nothing is open.
+#[tauri::command]
+fn audio_info(state: State<'_, AudioState>) -> Option<AudioInfo> {
+    state.info()
+}
+
+/// Close the open document and delete its PCM cache.
+#[tauri::command]
+fn close_file(state: State<'_, AudioState>, player: State<'_, Player>) {
+    if state.info().is_some() {
+        log::info!("closing document");
+    }
+    // Playback holds its own `Arc` on the PCM, so it would happily keep playing a file the
+    // user has closed. Stop it first so closing means what it says.
+    player.stop();
+    state.close();
+}
+
+/// Seamless statistics for the selection `[start, end)` on channel `ch`.
+///
+/// O(log N) in the selection length: this is the command the UI hits on every mouse-move of
+/// a selection drag, so it must never scan the selection.
+#[tauri::command]
+fn stats(
+    state: State<'_, AudioState>,
+    ch: usize,
+    start: usize,
+    end: usize,
+) -> Result<StatsDto, String> {
+    state.stats(ch, start, end).map_err(|e| e.to_string())
+}
+
+/// Min/max envelope of `[start, end)` on channel `ch`, bucketed into `bins` pixels.
+#[tauri::command]
+fn waveform(
+    state: State<'_, AudioState>,
+    ch: usize,
+    start: usize,
+    end: usize,
+    bins: usize,
+) -> Result<WaveformDto, String> {
+    state
+        .waveform(ch, start, end, bins)
+        .map_err(|e| e.to_string())
+}
+
+/// Play `[start, end)` of the open document on the default output device, replacing any
+/// current playback. The range is clamped to the document; an empty one is an error.
+#[tauri::command]
+fn play(
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    start: usize,
+    end: usize,
+) -> Result<PlaybackDto, String> {
+    let pcm = state.pcm().map_err(|e| e.to_string())?;
+    player
+        .play(pcm, start, end)
+        .inspect(|_| {
+            log::info!("playing frames [{start}, {end})");
+        })
+        .map_err(|e| {
+            log::error!("play([{start}, {end})) failed: {e}");
+            e.to_string()
+        })
+}
+
+/// Pause playback where it stands, keeping the device open. No-op when nothing is playing.
+#[tauri::command]
+fn pause_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.pause()
+}
+
+/// Resume a paused playback. No-op when nothing is playing.
+#[tauri::command]
+fn resume_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.resume()
+}
+
+/// Stop playback and release the output device.
+#[tauri::command]
+fn stop_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.stop();
+    player.status()
+}
+
+/// Transport state and playhead position.
+///
+/// The UI polls this per animation frame to draw the playhead, so it is only a handful of
+/// atomic loads — it never touches the device or the document.
+#[tauri::command]
+fn playback_status(player: State<'_, Player>) -> PlaybackDto {
+    player.status()
 }
 
 /// Receive a log line from the web UI and record it through the backend logger, so that
@@ -41,6 +201,9 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        // Native file picker. `open_file` needs a real filesystem path, which the webview's
+        // `<input type="file">` cannot supply — it only yields an opaque `File` handle.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(level)
@@ -56,6 +219,8 @@ pub fn run() {
                 ])
                 .build(),
         )
+        .manage(AudioState::default())
+        .manage(Player::default())
         .setup(|app| {
             log::info!(
                 "SoundForge {} starting (debug_assertions={})",
@@ -66,9 +231,49 @@ pub fn run() {
                 Ok(dir) => log::info!("log directory: {}", dir.display()),
                 Err(e) => log::warn!("could not resolve log directory: {e}"),
             }
+
+            // Reclaim PCM caches orphaned by an instance that died without running `Drop`
+            // (SIGKILL, force-quit, panic=abort). These are gigabyte-scale files, so leaving
+            // them would leak disk across crashes.
+            //
+            // This must stay in `setup`, which runs before the webview can invoke `open_file`:
+            // `sweep_at_startup` deletes caches bearing our own pid, which is only sound while
+            // this process has not written any yet. See its docs.
+            match cache_dir(app.handle()) {
+                Ok(dir) => {
+                    let swept =
+                        cache::sweep_at_startup(&dir, std::process::id(), cache::pid_is_live);
+                    if swept.removed > 0 || swept.failed > 0 {
+                        log::info!(
+                            "PCM cache sweep: reaped {} orphan(s), {} bytes; kept {}; {} failed",
+                            swept.removed,
+                            swept.bytes_freed,
+                            swept.kept,
+                            swept.failed
+                        );
+                    } else {
+                        log::debug!("PCM cache sweep: nothing to reap ({} kept)", swept.kept);
+                    }
+                }
+                // Never block startup over cache hygiene.
+                Err(e) => log::warn!("PCM cache sweep skipped: {e}"),
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ping, frontend_log])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            frontend_log,
+            open_file,
+            audio_info,
+            close_file,
+            stats,
+            waveform,
+            play,
+            pause_playback,
+            resume_playback,
+            stop_playback,
+            playback_status
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -43,6 +43,23 @@ jobs:
       - name: Doc tests (sf-core)
         run: cargo test -p sf-core --doc
 
+  # The web UI's pure logic (formatting, view geometry, request coalescing) lives in
+  # ui/lib.js and is tested with the Node built-in test runner. No dependencies and no
+  # build step, so this needs nothing but Node itself.
+  ui:
+    name: ui — tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test (ui)
+        run: npm test
+
   # Full workspace, including the Tauri shell, on an Apple-Silicon macOS runner.
   # This matches the project's Apple-Silicon-first target and builds the Tauri
   # crate against the native system WebView with no extra system packages.

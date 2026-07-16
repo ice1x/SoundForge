@@ -11,7 +11,9 @@
 #
 # Commands:
 #   check      Format check, clippy (-D warnings) and tests for the whole
-#              workspace. This is the gate that must be green before pushing.
+#              workspace, plus the ui/ tests. This is the gate that must be
+#              green before pushing.
+#   ui         Test the web UI's pure logic (node --test, no dependencies).
 #   core       Build the pure-Rust analysis core (sf-core) in release mode.
 #   build      Debug build of the whole workspace.
 #   release    Optimized release build of the whole workspace (default).
@@ -23,6 +25,7 @@
 #
 # Environment:
 #   CARGO   Override the cargo binary (default: cargo).
+#   NODE    Override the node binary (default: node), used by the ui/ tests.
 
 set -euo pipefail
 
@@ -32,6 +35,7 @@ ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd -P)"
 cd "${ROOT_DIR}"
 
 CARGO="${CARGO:-cargo}"
+NODE="${NODE:-node}"
 
 # Colored logging, but stay plain when stdout is not a terminal (e.g. in CI).
 if [ -t 1 ]; then
@@ -57,6 +61,12 @@ require_tauri_cli() {
   fi
 }
 
+require_node() {
+  if ! "${NODE}" --version >/dev/null 2>&1; then
+    die "Node is not installed (needed for the ui/ tests). Install Node 18+ or set NODE=/path/to/node"
+  fi
+}
+
 cmd_check() {
   step "Format check"
   "${CARGO}" fmt --all --check
@@ -64,7 +74,16 @@ cmd_check() {
   "${CARGO}" clippy --workspace --all-targets -- -D warnings
   step "Tests"
   "${CARGO}" test --workspace
+  step "UI tests"
+  cmd_ui
   ok "check passed"
+}
+
+# The web UI's pure logic is tested with the Node built-in runner: no dependencies, no
+# build step, nothing to install.
+cmd_ui() {
+  require_node
+  "${NODE}" --test "tests/ui/**/*.test.js"
 }
 
 cmd_core() {
@@ -119,6 +138,7 @@ main() {
   local command="${1:-release}"
   case "${command}" in
     check) cmd_check ;;
+    ui) cmd_ui ;;
     core) cmd_core ;;
     build) cmd_build ;;
     release) cmd_release ;;
