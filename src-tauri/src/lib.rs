@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
 
-use audio::{AudioInfo, AudioState, StatsDto, WaveformDto};
+use audio::{AudioInfo, AudioState, EditDto, EditOp, StatsDto, WaveformDto};
 use player::{PlaybackDto, Player};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
@@ -127,6 +127,55 @@ fn waveform(
     state
         .waveform(ch, start, end, bins)
         .map_err(|e| e.to_string())
+}
+
+/// Apply an in-place edit to `[start, end)` across every channel.
+///
+/// Stops playback first: the audio thread holds its own handle on the samples, so editing
+/// under it would be rejected as busy — and, more to the point, would be editing audio the
+/// user is currently listening to.
+#[tauri::command]
+fn edit(
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    op: EditOp,
+    start: usize,
+    end: usize,
+) -> Result<EditDto, String> {
+    player.stop();
+    state.edit(op, start, end).map_err(|e| {
+        log::error!("edit({op:?}, [{start}, {end})) failed: {e}");
+        e.to_string()
+    })
+}
+
+/// Discard everything outside `[start, end)`. Changes the document's length, so the UI must
+/// re-read the geometry from the returned `info`.
+#[tauri::command]
+fn trim(
+    app: tauri::AppHandle,
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    start: usize,
+    end: usize,
+) -> Result<EditDto, String> {
+    player.stop();
+    // A trim writes a whole new cache, so it needs its own unique path for the same reason
+    // an open does — see `cache::next_path`.
+    let cache = next_cache_path(&app)?;
+    state.trim(start, end, &cache).map_err(|e| {
+        log::error!("trim([{start}, {end})) failed: {e}");
+        // The trim may have created the file before failing; do not leave it behind.
+        let _ = std::fs::remove_file(&cache);
+        e.to_string()
+    })
+}
+
+/// Reverse the most recent edit.
+#[tauri::command]
+fn undo(state: State<'_, AudioState>, player: State<'_, Player>) -> Result<EditDto, String> {
+    player.stop();
+    state.undo().map_err(|e| e.to_string())
 }
 
 /// Play `[start, end)` of the open document on the default output device, replacing any
@@ -268,6 +317,9 @@ pub fn run() {
             close_file,
             stats,
             waveform,
+            edit,
+            trim,
+            undo,
             play,
             pause_playback,
             resume_playback,

@@ -22,10 +22,12 @@
 
 pub mod agg;
 pub mod decode;
+pub mod edit;
 pub mod stats;
 pub mod summary;
 
 pub use agg::Agg;
 pub use decode::{decode_file, DecodeError, PcmCache};
+pub use edit::{apply_gain, fade_in, fade_out, gain_for, normalize, peak, silence};
 pub use stats::{linear_to_db, RangeStats};
 pub use summary::{Analyzer, Pyramid};
