@@ -24,11 +24,11 @@
 //! larger than a decode packet is ever buffered, so arbitrarily long inputs are fine.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
+use memmap2::MmapMut;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -87,7 +87,7 @@ impl From<SymphoniaError> for DecodeError {
 /// The map borrows the OS page cache, so constructing a cache over a huge file is fast and
 /// resident memory stays low regardless of file size.
 pub struct PcmCache {
-    mmap: Mmap,
+    mmap: MmapMut,
     channels: usize,
     sample_rate: u32,
     /// Samples per channel (a.k.a. frames).
@@ -132,6 +132,40 @@ impl PcmCache {
         &self.as_f32()[start..start + self.frames]
     }
 
+    /// The samples of channel `ch`, mutably — the buffer edits are applied to.
+    ///
+    /// Writes land in the memory-mapped cache file, which is this document's backing store.
+    ///
+    /// # Warning
+    /// Changing samples invalidates any [`Pyramid`] built over this channel, and a pyramid of
+    /// the right length with stale contents is undetectable — see [`Analyzer::with_pyramid`].
+    /// Rebuild it for every channel you touch.
+    ///
+    /// # Panics
+    /// Panics if `ch >= channels`.
+    pub fn channel_mut(&mut self, ch: usize) -> &mut [f32] {
+        assert!(ch < self.channels, "channel {ch} out of range");
+        let start = ch * self.frames;
+        let frames = self.frames;
+        &mut self.as_f32_mut()[start..start + frames]
+    }
+
+    /// The whole map reinterpreted as mutable `f32`. Length is `channels * frames`.
+    fn as_f32_mut(&mut self) -> &mut [f32] {
+        // Same invariant as `as_f32`: page-aligned and a whole number of f32s by construction.
+        bytemuck::cast_slice_mut(&mut self.mmap)
+    }
+
+    /// Flush pending writes to the cache file.
+    ///
+    /// Not needed for correctness within one run — reads go through the same map — but it is
+    /// what makes an edit durable if the process dies, and it surfaces a full disk as an
+    /// error here rather than as a silent loss.
+    pub fn flush(&self) -> Result<(), DecodeError> {
+        self.mmap.flush()?;
+        Ok(())
+    }
+
     /// Build an [`Analyzer`] over channel `ch`, ready to answer seamless range queries.
     ///
     /// # Panics
@@ -150,7 +184,9 @@ impl PcmCache {
         sample_rate: u32,
     ) -> Result<Self, DecodeError> {
         assert!(channels > 0, "channels must be non-zero");
-        let file = File::open(path)?;
+        // Opened read+write because the map is writable: edits (task 16) change samples in
+        // place, and the cache file is this document's backing store, private to the app.
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
             return Err(DecodeError::Empty);
@@ -169,8 +205,11 @@ impl PcmCache {
                 "{total} samples is not divisible by {channels} channels"
             )));
         }
-        // SAFETY: we hold this file open and never mutate it while mapped.
-        let mmap = unsafe { Mmap::map(&file)? };
+        // SAFETY: the cache file is created by this process, is unique per open, and is
+        // never touched by anything else while mapped. The map is shared (not copy-on-write)
+        // on purpose: an edit belongs in the document's backing store, and the OS pages the
+        // dirty parts out lazily rather than holding a whole edited file in RAM.
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
         Ok(PcmCache {
             mmap,
             channels,

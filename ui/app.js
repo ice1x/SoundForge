@@ -107,6 +107,13 @@ let dragging = false;
 /// is. The backend owns this — the UI never guesses the position from a timer, because only
 /// the audio callback knows what has actually reached the device.
 let playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
+/// Whether the backend has anything on its undo stack. Owned by the backend — the UI never
+/// infers it from "I just made an edit", because an edit too large to snapshot is not
+/// undoable (see MAX_UNDO_BYTES).
+let canUndo = false;
+/// Basename of the open file, kept for the meta line: a trim changes the geometry, so the
+/// line is rebuilt from `info` and needs the name again.
+let currentName = '';
 
 // ---------- error banner ----------
 
@@ -372,6 +379,76 @@ async function stopPlayback() {
   }
 }
 
+// ---------- edits ----------
+
+/// Adopt an `EditDto`: the geometry may have changed (a trim), so everything downstream of
+/// `info.frames` is rebuilt from it rather than assumed.
+function applyEdit(dto, opts = {}) {
+  const trimmed = dto.info.frames !== info.frames;
+  info = dto.info;
+  canUndo = dto.canUndo;
+
+  if (trimmed) {
+    // A trim moves every sample: the old view and selection index a document that no longer
+    // exists, so re-fit rather than leaving them pointing at nothing.
+    view = fitView(info.frames);
+    sel = { start: 0, end: 0 };
+  }
+  $('fileMeta').textContent = fmtMeta(currentName, info);
+  envelopes = [];
+  refreshEnvelope();
+  drawOverlay();
+  updateStats();
+  updateEditControls();
+
+  if (opts.warnNotUndoable && !dto.lastUndoable) {
+    // The edit applied, but its snapshot was too big to keep. Saying nothing would leave
+    // Undo greyed out with no explanation.
+    showError('Edit applied, but it was too large to undo.');
+  }
+}
+
+/// Enable the edit row only when there is something to edit, and Undo only when there is
+/// something to undo.
+function updateEditControls() {
+  const live = !!info;
+  for (const id of ['normBtn', 'fadeInBtn', 'fadeOutBtn', 'silenceBtn', 'trimBtn']) {
+    $(id).disabled = !live;
+  }
+  $('undoBtn').disabled = !live || !canUndo;
+}
+
+/// Run an edit over the selection (or the whole file when there is none) — the same range
+/// the Statistics panel describes and the transport plays.
+async function runEdit(op) {
+  if (!info) return;
+  clearError();
+  const r = effectiveRange(sel, info.frames);
+  try {
+    // The backend stops playback itself; mirror that here so the button and playhead agree.
+    playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
+    $('playBtn').textContent = playLabel(playback.state);
+    const dto = op === 'trim'
+      ? await invoke('trim', { start: r.start, end: r.end })
+      : await invoke('edit', { op, start: r.start, end: r.end });
+    applyEdit(dto, { warnNotUndoable: true });
+  } catch (e) {
+    showError(`Could not apply the edit: ${e.message || e}`);
+  }
+}
+
+async function runUndo() {
+  if (!info || !canUndo) return;
+  clearError();
+  try {
+    playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
+    $('playBtn').textContent = playLabel(playback.state);
+    applyEdit(await invoke('undo'));
+  } catch (e) {
+    showError(`Could not undo: ${e.message || e}`);
+  }
+}
+
 // ---------- open / close ----------
 
 async function openPath(path) {
@@ -395,6 +472,8 @@ async function openPath(path) {
   info = opened;
 
   const name = path.split('/').pop() || path;
+  currentName = name;
+  canUndo = false;
   $('fileMeta').textContent = fmtMeta(name, info);
   sflog('info', `opened ${path}: ${info.channels} ch, ${info.sampleRate} Hz, ${info.frames} frames`);
 
@@ -409,6 +488,7 @@ async function openPath(path) {
 
   buildChannelSelector();
   setDocumentControlsEnabled(true);
+  updateEditControls();
   $('hint').style.display = 'none';
 
   fitCanvases();
@@ -445,6 +525,8 @@ async function closeFile() {
   envelopes = [];
   sel = { start: 0, end: 0 };
   setDocumentControlsEnabled(false);
+  canUndo = false;
+  updateEditControls();
   const chSel = $('chSel');
   chSel.innerHTML = '';
   chSel.disabled = true;
@@ -558,6 +640,12 @@ wrap.addEventListener(
 $('openBtn').addEventListener('click', pickFile);
 $('closeBtn').addEventListener('click', closeFile);
 $('playBtn').addEventListener('click', transport);
+$('normBtn').addEventListener('click', () => runEdit('normalize'));
+$('fadeInBtn').addEventListener('click', () => runEdit('fadeIn'));
+$('fadeOutBtn').addEventListener('click', () => runEdit('fadeOut'));
+$('silenceBtn').addEventListener('click', () => runEdit('silence'));
+$('trimBtn').addEventListener('click', () => runEdit('trim'));
+$('undoBtn').addEventListener('click', runUndo);
 $('selAllBtn').addEventListener('click', selectAll);
 $('clrSelBtn').addEventListener('click', clearSel);
 $('fitBtn').addEventListener('click', () => info && setView(fitView(info.frames)));
@@ -574,6 +662,10 @@ window.addEventListener('keydown', (e) => {
     selectAll();
   }
   if (e.key === 'Escape') clearSel();
+  if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+    e.preventDefault();
+    runUndo();
+  }
   if (e.key === ' ') {
     // Otherwise the browser scrolls, and a focused button would fire its click too — which
     // would toggle the transport twice.

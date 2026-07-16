@@ -51,10 +51,38 @@ The web UI calls these via `invoke()` (see `src-tauri/src/lib.rs`):
 | `resume_playback` | — | `PlaybackDto` |
 | `stop_playback` | — | `PlaybackDto` |
 | `playback_status` | — | `PlaybackDto` — transport state + playhead (polled per animation frame) |
+| `edit` | `op`, `start`, `end` | `EditDto` — `normalize`/`fadeIn`/`fadeOut`/`silence`, in place across every channel |
+| `trim` | `start`, `end` | `EditDto` — discard everything outside the range (changes `frames`) |
+| `undo` | — | `EditDto` — reverse the most recent edit |
 
 Ranges are half-open and clamped to the document; an empty selection yields zeroed stats.
 Values are **linear** — dB formatting stays in the UI (as in the `miniforge.html` prototype),
 which also keeps the JSON free of non-finite floats.
+
+### Edits
+
+Edits write straight through the memory-mapped cache — that file *is* the document's backing
+store — and apply to **every** channel: the Statistics channel selector chooses what you look
+at, not what gets edited. Normalize computes one gain from the loudest channel and applies it
+to all of them; a per-channel gain would equalise the channels and shift the stereo image.
+
+Every path that changes samples must rebuild the summary pyramid of the channels it touched,
+which is why edits go through `Document` rather than the cache directly — it is the only place
+that cannot forget. A pyramid whose length still matches but whose contents are stale is
+**undetectable** (`Analyzer::with_pyramid` only asserts the length) and would silently answer
+every later query from pre-edit blocks.
+
+Undo snapshots the original samples, so its cost follows the *selection*, not the file. That
+still means "Select all → Normalize" on a 2-hour stereo file would snapshot ~2.8 GB, so the
+stack is capped (`MAX_UNDO_BYTES`, 256 MB): older entries are evicted, and an edit whose own
+snapshot exceeds the cap applies **without being undoable** rather than pretending —
+`EditDto.lastUndoable` says which, and the UI says so out loud.
+
+Trim is the exception: it changes the document's length, so it writes a fresh planar cache and
+swaps onto it. The previous cache file becomes the undo record instead of being deleted, which
+makes it reversible without copying the samples into memory; the entry deletes that file if it
+is ever dropped unapplied. A trim also clears older undo entries, whose offsets index the
+untrimmed document.
 
 ### Playback
 
@@ -193,7 +221,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
 - [x] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
 - [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
-- [ ] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
+- [x] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
 - [ ] 17 — WAV export (`hound`) of selection or whole file
 - [ ] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
 - [ ] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon

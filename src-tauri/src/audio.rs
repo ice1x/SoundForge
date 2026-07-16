@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sf_core::{decode_file, stats::RangeStats, Analyzer, DecodeError, PcmCache, Pyramid};
 
 /// Upper bound on waveform bins per request. A bin maps to one horizontal pixel, so this is
@@ -36,6 +36,14 @@ pub enum AudioError {
     TooManyBins { bins: usize, max: usize },
     /// The source file could not be decoded into a PCM cache.
     Decode(DecodeError),
+    /// The samples are in use elsewhere (playback), so they cannot be edited right now.
+    Busy,
+    /// The edit needs a selection and was given an empty one.
+    EmptyRange,
+    /// Nothing left to undo.
+    NothingToUndo,
+    /// Writing the trimmed cache failed.
+    Io(String),
 }
 
 impl std::fmt::Display for AudioError {
@@ -49,6 +57,10 @@ impl std::fmt::Display for AudioError {
                 write!(f, "requested {bins} waveform bins, maximum is {max}")
             }
             AudioError::Decode(e) => write!(f, "{e}"),
+            AudioError::Busy => write!(f, "the audio is in use (stop playback first)"),
+            AudioError::EmptyRange => write!(f, "select a range first"),
+            AudioError::NothingToUndo => write!(f, "nothing to undo"),
+            AudioError::Io(e) => write!(f, "{e}"),
         }
     }
 }
@@ -137,6 +149,100 @@ pub struct WaveformDto {
     pub max: Vec<f32>,
 }
 
+/// The document after an edit, plus what the Undo button should now look like.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditDto {
+    /// Geometry after the edit. `frames` changes on a trim, so the UI must re-read it.
+    pub info: AudioInfo,
+    /// Whether the undo stack has anything in it.
+    pub can_undo: bool,
+    /// Whether *this* edit was recorded. False means it applied but is not reversible — its
+    /// snapshot exceeded [`MAX_UNDO_BYTES`]. See there.
+    pub last_undoable: bool,
+}
+
+/// Total sample data the undo stack may hold in memory.
+///
+/// Undo snapshots the original samples, so its cost scales with the *selection*, not the
+/// file — but "Select all → Normalize" on a 2-hour stereo file would snapshot ~2.8 GB, which
+/// is exactly the "behaves like a short file" promise breaking. So the stack is capped:
+/// older entries are evicted to make room, and an edit whose own snapshot exceeds the cap
+/// applies without being undoable rather than pretending. [`EditDto::can_undo`] tells the UI
+/// which it got, so the Undo button reflects the truth.
+pub const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
+
+/// An in-place edit: changes sample values, never the document's length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EditOp {
+    /// Scale so the loudest sample in the selection reaches full scale.
+    Normalize,
+    FadeIn,
+    FadeOut,
+    Silence,
+}
+
+impl EditOp {
+    fn name(self) -> &'static str {
+        match self {
+            EditOp::Normalize => "normalize",
+            EditOp::FadeIn => "fade in",
+            EditOp::FadeOut => "fade out",
+            EditOp::Silence => "silence",
+        }
+    }
+}
+
+/// One reversible step.
+enum UndoEntry {
+    /// An in-place edit: the original samples of `[start, start + len)` per channel.
+    Samples {
+        start: usize,
+        /// One vector per channel, all the same length.
+        channels: Vec<Vec<f32>>,
+    },
+    /// A trim: the document it replaced. The old cache file is kept alive by this entry —
+    /// `cache_path` is `None` once the entry has been applied and has handed it back.
+    Trim {
+        cache_path: Option<PathBuf>,
+        info: AudioInfo,
+    },
+}
+
+impl UndoEntry {
+    /// Sample bytes this entry holds in memory.
+    fn bytes(&self) -> usize {
+        match self {
+            UndoEntry::Samples { channels, .. } => channels
+                .iter()
+                .map(|c| c.len() * std::mem::size_of::<f32>())
+                .sum(),
+            // A trim's cost is a file on disk, not memory.
+            UndoEntry::Trim { .. } => 0,
+        }
+    }
+}
+
+impl Drop for UndoEntry {
+    fn drop(&mut self) {
+        // A `Trim` entry owns the cache file of the document it replaced. If the entry is
+        // dropped without being applied — the stack was evicted, or the document closed —
+        // nothing else will ever remove that file, so it goes here. An applied entry has
+        // already `take`n the path, so this cannot delete a live document's cache. Any that
+        // still escape (a crash between the two) are reaped by the startup sweep.
+        if let UndoEntry::Trim {
+            cache_path: Some(p),
+            ..
+        } = self
+        {
+            if let Err(e) = std::fs::remove_file(&*p) {
+                log::debug!("could not remove undo cache {}: {e}", p.display());
+            }
+        }
+    }
+}
+
 /// An open audio file: the memory-mapped PCM plus its per-channel pyramids.
 struct Document {
     info: AudioInfo,
@@ -146,12 +252,62 @@ struct Document {
     /// One pyramid per channel, built once at open time. See the module docs.
     pyramids: Vec<Pyramid>,
     cache_path: PathBuf,
+    /// Most recent last.
+    undo: Vec<UndoEntry>,
 }
 
 impl Document {
     /// A borrowing analyzer over channel `ch`. O(1): the pyramid is already built.
     fn analyzer(&self, ch: usize) -> Analyzer<'_> {
         Analyzer::with_pyramid(self.cache.channel(ch), &self.pyramids[ch])
+    }
+
+    /// Exclusive access to the samples.
+    ///
+    /// Fails with [`AudioError::Busy`] while playback holds its own handle: the audio path
+    /// reads these samples from another thread, and editing under it would be a data race
+    /// (and, audibly, a click). Callers stop playback first — see the `edit` command.
+    fn cache_mut(&mut self) -> Result<&mut PcmCache, AudioError> {
+        Arc::get_mut(&mut self.cache).ok_or(AudioError::Busy)
+    }
+
+    /// Rebuild the summary pyramids for `channels`.
+    ///
+    /// **Every** path that changes samples must end here. A pyramid whose length still
+    /// matches but whose contents are stale is undetectable — `Analyzer::with_pyramid` only
+    /// asserts the length — and would silently answer every later query from pre-edit blocks.
+    /// This is the single reason edits go through `Document` rather than touching the cache
+    /// directly: it is the only place that cannot forget.
+    fn rebuild_pyramids(&mut self, channels: impl IntoIterator<Item = usize>) {
+        for ch in channels {
+            self.pyramids[ch] = Pyramid::build(self.cache.channel(ch));
+        }
+    }
+
+    /// Push an undo entry, evicting oldest-first to stay under [`MAX_UNDO_BYTES`].
+    ///
+    /// An entry too big to fit on its own is not recorded at all and clears the stack: the
+    /// alternative is holding gigabytes of snapshot for one keystroke. Returns whether the
+    /// edit ended up undoable.
+    fn push_undo(&mut self, entry: UndoEntry) -> bool {
+        if entry.bytes() > MAX_UNDO_BYTES {
+            // Later entries describe a document this one no longer matches, so keeping them
+            // would let Undo restore samples into the wrong place.
+            self.undo.clear();
+            log::info!(
+                "edit is too large to undo ({} MB > {} MB cap); undo history cleared",
+                entry.bytes() / 1024 / 1024,
+                MAX_UNDO_BYTES / 1024 / 1024
+            );
+            return false;
+        }
+        self.undo.push(entry);
+        let mut total: usize = self.undo.iter().map(|e| e.bytes()).sum();
+        while total > MAX_UNDO_BYTES && self.undo.len() > 1 {
+            let dropped = self.undo.remove(0);
+            total -= dropped.bytes();
+        }
+        true
     }
 
     /// Reject an out-of-range channel. `PcmCache::channel` panics on one, and a panic
@@ -224,6 +380,7 @@ impl AudioState {
             cache: Arc::new(cache),
             pyramids,
             cache_path: cache_path.to_path_buf(),
+            undo: Vec::new(),
         };
         *self.lock() = Some(doc);
         Ok(info)
@@ -268,6 +425,219 @@ impl AudioState {
             ch,
             RangeStats::from_agg(&agg, start_s, doc.info.sample_rate),
         ))
+    }
+
+    /// Apply `op` to `[start, end)` across **every** channel, and record it for undo.
+    ///
+    /// The range is clamped to the document; an empty one is [`AudioError::EmptyRange`] —
+    /// unlike `stats`, which zeroes an empty selection so a drag can query freely. An edit is
+    /// a deliberate act on a chosen range, and silently editing nothing would be worse than
+    /// saying so.
+    ///
+    /// Applies to all channels, not one: the Statistics panel's channel selector chooses what
+    /// you *look at*, and using it to decide what gets *edited* would silence one side of a
+    /// stereo file because the panel happened to be showing channel 0.
+    pub fn edit(&self, op: EditOp, start: usize, end: usize) -> Result<EditDto, AudioError> {
+        let mut guard = self.lock();
+        let doc = guard.as_mut().ok_or(AudioError::NoDocument)?;
+        let frames = doc.info.frames;
+        let channels = doc.info.channels;
+        let start = start.min(frames);
+        let end = end.min(frames);
+        if start >= end {
+            return Err(AudioError::EmptyRange);
+        }
+
+        let cache = doc.cache_mut()?;
+        // Snapshot before touching anything: on the error paths below the document must be
+        // exactly as it was.
+        let original: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| cache.channel(ch)[start..end].to_vec())
+            .collect();
+
+        match op {
+            // One gain across every channel, computed from the loudest of them. Per-channel
+            // gains would equalise the channels and shift the stereo image.
+            EditOp::Normalize => {
+                let peak = (0..channels)
+                    .map(|ch| sf_core::peak(&cache.channel(ch)[start..end]))
+                    .fold(0.0f32, f32::max);
+                let gain = sf_core::gain_for(peak, 1.0);
+                for ch in 0..channels {
+                    sf_core::apply_gain(&mut cache.channel_mut(ch)[start..end], gain);
+                }
+                log::info!("normalize [{start}, {end}): peak {peak:.4} -> gain {gain:.4}");
+            }
+            EditOp::FadeIn => {
+                for ch in 0..channels {
+                    sf_core::fade_in(&mut cache.channel_mut(ch)[start..end]);
+                }
+            }
+            EditOp::FadeOut => {
+                for ch in 0..channels {
+                    sf_core::fade_out(&mut cache.channel_mut(ch)[start..end]);
+                }
+            }
+            EditOp::Silence => {
+                for ch in 0..channels {
+                    sf_core::silence(&mut cache.channel_mut(ch)[start..end]);
+                }
+            }
+        }
+
+        doc.rebuild_pyramids(0..channels);
+        let can_undo = doc.push_undo(UndoEntry::Samples {
+            start,
+            channels: original,
+        });
+        log::info!("applied {} to [{start}, {end})", op.name());
+        Ok(EditDto {
+            info: doc.info.clone(),
+            can_undo: !doc.undo.is_empty(),
+            last_undoable: can_undo,
+        })
+    }
+
+    /// Discard everything outside `[start, end)`, making the selection the whole document.
+    ///
+    /// Unlike the in-place edits this changes the document's *length*, so it cannot write
+    /// through the existing map: it writes a fresh planar cache at `new_cache_path` (which
+    /// must be unique — see [`crate::cache::next_path`]) and swaps the document onto it. The
+    /// previous cache file is handed to the undo stack rather than deleted, which is what
+    /// makes this reversible without copying the samples into memory.
+    pub fn trim(
+        &self,
+        start: usize,
+        end: usize,
+        new_cache_path: &Path,
+    ) -> Result<EditDto, AudioError> {
+        let mut guard = self.lock();
+        let doc = guard.as_mut().ok_or(AudioError::NoDocument)?;
+        let frames = doc.info.frames;
+        let channels = doc.info.channels;
+        let sample_rate = doc.info.sample_rate;
+        let start = start.min(frames);
+        let end = end.min(frames);
+        if start >= end {
+            return Err(AudioError::EmptyRange);
+        }
+        if start == 0 && end == frames {
+            // Trimming to the whole file would otherwise burn a full copy to say "nothing
+            // changed", and push an undo entry that restores an identical document.
+            return Ok(EditDto {
+                info: doc.info.clone(),
+                can_undo: !doc.undo.is_empty(),
+                last_undoable: false,
+            });
+        }
+        // Reject before writing anything: a trim under playback would swap the samples out
+        // from under the audio thread.
+        doc.cache_mut()?;
+
+        // Write the kept range as a new planar cache, channel by channel, straight from the
+        // old map — never materialising the document in memory.
+        let mut out = std::fs::File::create(new_cache_path).map_err(|e| {
+            AudioError::Io(format!(
+                "could not create {}: {e}",
+                new_cache_path.display()
+            ))
+        })?;
+        {
+            use std::io::Write;
+            for ch in 0..channels {
+                let slice = &doc.cache.channel(ch)[start..end];
+                out.write_all(bytemuck::cast_slice(slice)).map_err(|e| {
+                    AudioError::Io(format!("could not write the trimmed cache: {e}"))
+                })?;
+            }
+            out.flush()
+                .map_err(|e| AudioError::Io(format!("could not flush the trimmed cache: {e}")))?;
+        }
+        drop(out);
+
+        let new_cache = PcmCache::open_planar(new_cache_path, channels, sample_rate)?;
+        let new_frames = new_cache.frames();
+        let pyramids: Vec<Pyramid> = (0..channels)
+            .map(|ch| Pyramid::build(new_cache.channel(ch)))
+            .collect();
+
+        let old_info = doc.info.clone();
+        let old_path = std::mem::replace(&mut doc.cache_path, new_cache_path.to_path_buf());
+        doc.cache = Arc::new(new_cache);
+        doc.pyramids = pyramids;
+        doc.info.frames = new_frames;
+        doc.info.duration_s = new_frames as f64 / sample_rate as f64;
+
+        // Every earlier entry's `start` indexes the untrimmed document, so applying one after
+        // this trim would write samples at the wrong offset. They go.
+        doc.undo.clear();
+        doc.undo.push(UndoEntry::Trim {
+            cache_path: Some(old_path),
+            info: old_info,
+        });
+        log::info!("trimmed to [{start}, {end}): {new_frames} frames remain");
+        Ok(EditDto {
+            info: doc.info.clone(),
+            can_undo: true,
+            last_undoable: true,
+        })
+    }
+
+    /// Reverse the most recent edit.
+    pub fn undo(&self) -> Result<EditDto, AudioError> {
+        let mut guard = self.lock();
+        let doc = guard.as_mut().ok_or(AudioError::NoDocument)?;
+        if doc.undo.is_empty() {
+            return Err(AudioError::NothingToUndo);
+        }
+        // Check before popping, so a rejected undo leaves the stack intact.
+        doc.cache_mut()?;
+        let mut entry = doc.undo.pop().expect("checked non-empty");
+
+        match &mut entry {
+            UndoEntry::Samples { start, channels } => {
+                let start = *start;
+                let cache = doc.cache_mut()?;
+                for (ch, original) in channels.iter().enumerate() {
+                    cache.channel_mut(ch)[start..start + original.len()].copy_from_slice(original);
+                }
+                let n = channels.len();
+                doc.rebuild_pyramids(0..n);
+                log::info!("undid an edit at [{start}, {})", start + channels[0].len());
+            }
+            UndoEntry::Trim { cache_path, info } => {
+                let path = cache_path
+                    .take()
+                    .expect("an unapplied Trim entry owns its path");
+                let restored = PcmCache::open_planar(&path, info.channels, info.sample_rate)?;
+                let pyramids: Vec<Pyramid> = (0..info.channels)
+                    .map(|ch| Pyramid::build(restored.channel(ch)))
+                    .collect();
+                // Dropping the Document would take the *trimmed* cache with it, so remove it
+                // explicitly here: we are replacing the file, not the document.
+                let trimmed_path = std::mem::replace(&mut doc.cache_path, path);
+                doc.cache = Arc::new(restored);
+                doc.pyramids = pyramids;
+                doc.info = info.clone();
+                if let Err(e) = std::fs::remove_file(&trimmed_path) {
+                    log::debug!(
+                        "could not remove trimmed cache {}: {e}",
+                        trimmed_path.display()
+                    );
+                }
+                log::info!("undid a trim: {} frames restored", doc.info.frames);
+            }
+        }
+        Ok(EditDto {
+            info: doc.info.clone(),
+            can_undo: !doc.undo.is_empty(),
+            last_undoable: true,
+        })
+    }
+
+    /// Whether there is anything to undo.
+    pub fn can_undo(&self) -> bool {
+        self.lock().as_ref().is_some_and(|d| !d.undo.is_empty())
     }
 
     /// Min/max envelope of `[start, end)` on channel `ch`, bucketed into `bins` pixels.
@@ -646,6 +1016,407 @@ mod tests {
         // A failed open must not leave a half-open document behind.
         assert!(state.info().is_none());
         assert!(!err.to_string().is_empty());
+    }
+
+    // ---------- edits ----------
+
+    /// Frames in the edit fixture.
+    ///
+    /// Deliberately several `sf_core::summary::LEAF` blocks (LEAF is 1024): a range query
+    /// shorter than one leaf is served by scanning raw samples and never consults the
+    /// pyramid, so a fixture under 1024 frames cannot detect a stale pyramid at all — the
+    /// exact failure these tests exist to catch. Verified by mutation: with 1000 frames,
+    /// deleting the rebuild from `undo` killed nothing.
+    const FIXTURE_FRAMES: usize = 8192;
+
+    /// A stereo document: channel 0 loud, channel 1 four times quieter. Any edit that treats
+    /// the channels independently shows up as the two drifting apart.
+    fn open_stereo() -> (AudioState, Cleanup, PathBuf) {
+        let src = tmp("edit.wav");
+        let cache = tmp("edit.pcm");
+        let guard = Cleanup(vec![src.clone(), cache.clone()]);
+        let loud: Vec<f32> = (0..FIXTURE_FRAMES)
+            .map(|i| 0.5 * (i as f32 * 0.05).sin())
+            .collect();
+        let quiet: Vec<f32> = loud.iter().map(|s| s * 0.25).collect();
+        write_wav(&src, &[loud, quiet], 8000);
+        let state = AudioState::default();
+        state.open(&src, &cache).unwrap();
+        (state, guard, cache)
+    }
+
+    #[test]
+    fn normalize_lifts_the_selection_to_full_scale() {
+        let (state, _c, _p) = open_stereo();
+        state.edit(EditOp::Normalize, 0, FIXTURE_FRAMES).unwrap();
+        let l = state.stats(0, 0, FIXTURE_FRAMES).unwrap();
+        assert!((l.peak - 1.0).abs() < 1e-4, "peak {}", l.peak);
+    }
+
+    #[test]
+    fn normalize_uses_one_gain_across_channels_and_keeps_the_balance() {
+        // The channels start 4x apart. Normalizing each to its own peak would make them
+        // equal — audibly, a hard-panned mix would jump to the centre.
+        let (state, _c, _p) = open_stereo();
+        let before = (
+            state.stats(0, 0, FIXTURE_FRAMES).unwrap().peak,
+            state.stats(1, 0, FIXTURE_FRAMES).unwrap().peak,
+        );
+        assert!(
+            (before.0 / before.1 - 4.0).abs() < 1e-3,
+            "fixture: {before:?}"
+        );
+
+        state.edit(EditOp::Normalize, 0, FIXTURE_FRAMES).unwrap();
+        let after = (
+            state.stats(0, 0, FIXTURE_FRAMES).unwrap().peak,
+            state.stats(1, 0, FIXTURE_FRAMES).unwrap().peak,
+        );
+        assert!((after.0 - 1.0).abs() < 1e-4, "loud channel {}", after.0);
+        assert!(
+            (after.1 - 0.25).abs() < 1e-4,
+            "quiet channel must stay 4x quieter, got {}",
+            after.1
+        );
+    }
+
+    #[test]
+    fn an_edit_rebuilds_the_pyramid_so_stats_reflect_it() {
+        // THE trap this module exists to close: an edit changes sample values without
+        // changing the length, and `Analyzer::with_pyramid` only asserts the length. A
+        // forgotten rebuild is invisible — every later query silently answers from pre-edit
+        // blocks. `stats` goes through the pyramid, so this catches it.
+        let (state, _c, _p) = open_stereo();
+        assert!(state.stats(0, 0, FIXTURE_FRAMES).unwrap().peak > 0.4);
+
+        state.edit(EditOp::Silence, 0, FIXTURE_FRAMES).unwrap();
+
+        let st = state.stats(0, 0, FIXTURE_FRAMES).unwrap();
+        assert_eq!(st.peak, 0.0, "stats came from a stale pyramid");
+        assert_eq!(st.rms, 0.0);
+        assert_eq!(st.zero_crossings, 0);
+        // The waveform reads the pyramid too.
+        let wf = state.waveform(0, 0, FIXTURE_FRAMES, 8).unwrap();
+        assert!(wf.max.iter().all(|&v| v == 0.0), "envelope is stale");
+    }
+
+    #[test]
+    fn an_edit_touches_only_the_selected_range() {
+        let (state, _c, _p) = open_stereo();
+        let half = FIXTURE_FRAMES / 2;
+        let before_tail = state.stats(0, half, FIXTURE_FRAMES).unwrap().peak;
+        state.edit(EditOp::Silence, 0, half).unwrap();
+        assert_eq!(state.stats(0, 0, half).unwrap().peak, 0.0);
+        assert_eq!(
+            state.stats(0, half, FIXTURE_FRAMES).unwrap().peak,
+            before_tail,
+            "audio outside the selection changed"
+        );
+    }
+
+    #[test]
+    fn fades_run_the_right_way_round() {
+        let (state, _c, _p) = open_stereo();
+        let tail = FIXTURE_FRAMES - 50;
+        state.edit(EditOp::FadeIn, 0, FIXTURE_FRAMES).unwrap();
+        // A fade in leaves the start near silence and the end untouched.
+        assert!(state.stats(0, 0, 50).unwrap().peak < 0.05, "fade in start");
+        assert!(
+            state.stats(0, tail, FIXTURE_FRAMES).unwrap().peak > 0.4,
+            "fade in end"
+        );
+
+        let (state2, _c2, _p2) = open_stereo();
+        state2.edit(EditOp::FadeOut, 0, FIXTURE_FRAMES).unwrap();
+        assert!(
+            state2.stats(0, tail, FIXTURE_FRAMES).unwrap().peak < 0.05,
+            "fade out end"
+        );
+        assert!(state2.stats(0, 0, 50).unwrap().peak > 0.4, "fade out start");
+    }
+
+    #[test]
+    fn an_empty_selection_is_rejected_rather_than_silently_editing_nothing() {
+        // Unlike `stats`, which zeroes an empty range so a drag can query freely.
+        let (state, _c, _p) = open_stereo();
+        for &(s, e) in &[(500usize, 500usize), (900, 400), (99_000, 100_000)] {
+            assert!(
+                matches!(
+                    state.edit(EditOp::Silence, s, e),
+                    Err(AudioError::EmptyRange)
+                ),
+                "[{s},{e})"
+            );
+        }
+        assert!(matches!(
+            AudioState::default().edit(EditOp::Silence, 0, 1),
+            Err(AudioError::NoDocument)
+        ));
+    }
+
+    #[test]
+    fn an_edit_cannot_run_while_playback_holds_the_samples() {
+        // Editing under the audio thread would be a data race on the mmap.
+        let (state, _c, _p) = open_stereo();
+        let held = state.pcm().unwrap();
+        assert!(matches!(
+            state.edit(EditOp::Silence, 0, 100),
+            Err(AudioError::Busy)
+        ));
+        // And the document is untouched by the rejection.
+        assert!(state.stats(0, 0, 100).unwrap().peak > 0.0);
+        drop(held);
+        assert!(state.edit(EditOp::Silence, 0, 100).is_ok(), "freed again");
+    }
+
+    // ---------- undo ----------
+
+    #[test]
+    fn undo_restores_the_samples_exactly() {
+        let (state, _c, _p) = open_stereo();
+        let before: Vec<StatsDto> = (0..2)
+            .map(|ch| state.stats(ch, 0, FIXTURE_FRAMES).unwrap())
+            .collect();
+        assert!(!state.can_undo());
+
+        state.edit(EditOp::Normalize, 100, 5000).unwrap();
+        assert!(state.can_undo());
+        assert_ne!(state.stats(0, 100, 5000).unwrap().peak, before[0].peak);
+
+        state.undo().unwrap();
+        for (ch, want) in before.iter().enumerate() {
+            assert_eq!(
+                &state.stats(ch, 0, FIXTURE_FRAMES).unwrap(),
+                want,
+                "channel {ch} not restored"
+            );
+        }
+        assert!(!state.can_undo());
+        assert!(matches!(state.undo(), Err(AudioError::NothingToUndo)));
+    }
+
+    #[test]
+    fn undo_rebuilds_the_pyramid_too() {
+        // Restoring the samples but not the pyramid is the same trap in reverse.
+        let (state, _c, _p) = open_stereo();
+        let before = state.waveform(0, 0, FIXTURE_FRAMES, 8).unwrap();
+        let stats_before = state.stats(0, 0, FIXTURE_FRAMES).unwrap();
+        state.edit(EditOp::Silence, 0, FIXTURE_FRAMES).unwrap();
+        state.undo().unwrap();
+        assert_eq!(state.waveform(0, 0, FIXTURE_FRAMES, 8).unwrap(), before);
+        // The range query stitches whole leaf blocks out of the pyramid, so a rebuild the
+        // undo forgot shows up right here.
+        assert_eq!(state.stats(0, 0, FIXTURE_FRAMES).unwrap(), stats_before);
+    }
+
+    #[test]
+    fn undo_unwinds_several_edits_in_reverse_order() {
+        let (state, _c, _p) = open_stereo();
+        let before = state.stats(0, 0, FIXTURE_FRAMES).unwrap();
+        state.edit(EditOp::Silence, 0, 2000).unwrap();
+        let after_first = state.stats(0, 0, FIXTURE_FRAMES).unwrap();
+        state.edit(EditOp::Silence, 6000, FIXTURE_FRAMES).unwrap();
+
+        state.undo().unwrap();
+        assert_eq!(
+            state.stats(0, 0, FIXTURE_FRAMES).unwrap(),
+            after_first,
+            "second undone"
+        );
+        state.undo().unwrap();
+        assert_eq!(
+            state.stats(0, 0, FIXTURE_FRAMES).unwrap(),
+            before,
+            "first undone"
+        );
+    }
+
+    #[test]
+    fn an_undo_too_large_to_record_is_reported_not_hidden() {
+        // The cap exists so "Select all -> Normalize" on a multi-hour file cannot snapshot
+        // gigabytes. When it bites, the UI must be told, or Undo lies.
+        let src = tmp("big.wav");
+        let cache = tmp("big.pcm");
+        let _c = Cleanup(vec![src.clone(), cache.clone()]);
+        // One channel of > MAX_UNDO_BYTES / 4 samples.
+        let n = MAX_UNDO_BYTES / std::mem::size_of::<f32>() + 1024;
+        write_wav(&src, std::slice::from_ref(&vec![0.5f32; n]), 8000);
+        let state = AudioState::default();
+        state.open(&src, &cache).unwrap();
+
+        let dto = state.edit(EditOp::Silence, 0, n).unwrap();
+        assert!(!dto.last_undoable, "an oversized edit must report itself");
+        assert!(!dto.can_undo, "and must not leave a bogus undo entry");
+        // The edit itself still happened.
+        assert_eq!(state.stats(0, 0, n).unwrap().peak, 0.0);
+        assert!(matches!(state.undo(), Err(AudioError::NothingToUndo)));
+    }
+
+    #[test]
+    fn the_undo_stack_stays_under_its_memory_cap() {
+        let src = tmp("cap.wav");
+        let cache = tmp("cap.pcm");
+        let _c = Cleanup(vec![src.clone(), cache.clone()]);
+        // Each edit below snapshots ~40% of the cap, so the third must evict the first.
+        let n = (MAX_UNDO_BYTES / std::mem::size_of::<f32>()) * 2 / 5;
+        write_wav(&src, std::slice::from_ref(&vec![0.5f32; n]), 8000);
+        let state = AudioState::default();
+        state.open(&src, &cache).unwrap();
+
+        for _ in 0..3 {
+            assert!(state.edit(EditOp::Silence, 0, n).unwrap().last_undoable);
+        }
+        let guard = state.lock();
+        let doc = guard.as_ref().unwrap();
+        let total: usize = doc.undo.iter().map(|e| e.bytes()).sum();
+        assert!(total <= MAX_UNDO_BYTES, "{total} bytes over the cap");
+        assert!(doc.undo.len() < 3, "oldest entry should have been evicted");
+    }
+
+    // ---------- trim ----------
+
+    #[test]
+    fn trim_keeps_only_the_selection_and_reports_the_new_geometry() {
+        let (state, _c, _old) = open_stereo();
+        let kept = state.stats(0, 2000, 7000).unwrap();
+        let new_cache = tmp("trimmed.pcm");
+        let _c2 = Cleanup(vec![new_cache.clone()]);
+
+        let dto = state.trim(2000, 7000, &new_cache).unwrap();
+        assert_eq!(dto.info.frames, 5000);
+        assert!((dto.info.duration_s - 5000.0 / 8000.0).abs() < 1e-9);
+        assert_eq!(state.info().unwrap().frames, 5000);
+
+        // The kept audio is the same audio, now at the front.
+        let now = state.stats(0, 0, 5000).unwrap();
+        assert_eq!(now.n, kept.n);
+        assert_eq!(now.min, kept.min);
+        assert_eq!(now.max, kept.max);
+        assert!((now.rms - kept.rms).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trim_replaces_the_cache_file_and_removes_the_old_one_only_on_undo() {
+        let (state, _c, old_cache) = open_stereo();
+        let new_cache = tmp("trim2.pcm");
+        let _c2 = Cleanup(vec![new_cache.clone()]);
+
+        state.trim(1000, 6000, &new_cache).unwrap();
+        assert!(new_cache.exists(), "the trimmed cache must exist");
+        assert!(
+            old_cache.exists(),
+            "the old cache is the undo record — it must survive the trim"
+        );
+
+        state.undo().unwrap();
+        assert_eq!(
+            state.info().unwrap().frames,
+            FIXTURE_FRAMES,
+            "geometry restored"
+        );
+        assert!(old_cache.exists(), "restored document uses the old cache");
+        assert!(
+            !new_cache.exists(),
+            "the trimmed cache should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn an_undone_trim_restores_the_audio_itself() {
+        let (state, _c, _old) = open_stereo();
+        let before: Vec<StatsDto> = (0..2)
+            .map(|ch| state.stats(ch, 0, FIXTURE_FRAMES).unwrap())
+            .collect();
+        let new_cache = tmp("trim3.pcm");
+        let _c2 = Cleanup(vec![new_cache.clone()]);
+
+        state.trim(3000, 4000, &new_cache).unwrap();
+        state.undo().unwrap();
+        for (ch, want) in before.iter().enumerate() {
+            assert_eq!(
+                &state.stats(ch, 0, FIXTURE_FRAMES).unwrap(),
+                want,
+                "channel {ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_trim_undo_entry_takes_its_cache_file_with_it() {
+        // The old cache outlives the document that owned it, so nothing else would ever
+        // remove it. Closing the document must not leak a gigabyte.
+        let (state, _c, old_cache) = open_stereo();
+        let new_cache = tmp("trim4.pcm");
+        let _c2 = Cleanup(vec![new_cache.clone()]);
+        state.trim(0, 5000, &new_cache).unwrap();
+        assert!(old_cache.exists());
+
+        state.close();
+        assert!(!old_cache.exists(), "undo's cache file leaked on close");
+        assert!(
+            !new_cache.exists(),
+            "the document's own cache leaked on close"
+        );
+    }
+
+    #[test]
+    fn trimming_to_the_whole_file_is_a_no_op() {
+        let (state, _c, _old) = open_stereo();
+        let new_cache = tmp("trim5.pcm");
+        let dto = state.trim(0, FIXTURE_FRAMES, &new_cache).unwrap();
+        assert_eq!(dto.info.frames, FIXTURE_FRAMES);
+        assert!(!dto.last_undoable);
+        assert!(!new_cache.exists(), "a no-op trim must not burn a copy");
+    }
+
+    #[test]
+    fn a_trim_discards_earlier_undo_entries() {
+        // Their `start` indexes the untrimmed document; applying one afterwards would write
+        // samples at the wrong offset.
+        let (state, _c, _old) = open_stereo();
+        let new_cache = tmp("trim6.pcm");
+        let _c2 = Cleanup(vec![new_cache.clone()]);
+        state.edit(EditOp::Silence, 7000, FIXTURE_FRAMES).unwrap();
+        state.trim(0, 5000, &new_cache).unwrap();
+
+        state.undo().unwrap(); // undoes the trim
+        assert_eq!(state.info().unwrap().frames, FIXTURE_FRAMES);
+        assert!(!state.can_undo(), "pre-trim entries must not survive");
+    }
+
+    #[test]
+    fn trim_rejects_an_empty_selection_and_a_busy_document() {
+        let (state, _c, _old) = open_stereo();
+        let new_cache = tmp("trim7.pcm");
+        assert!(matches!(
+            state.trim(400, 400, &new_cache),
+            Err(AudioError::EmptyRange)
+        ));
+        let held = state.pcm().unwrap();
+        assert!(matches!(
+            state.trim(0, 5000, &new_cache),
+            Err(AudioError::Busy)
+        ));
+        drop(held);
+        assert!(!new_cache.exists(), "a rejected trim must not leave a file");
+    }
+
+    #[test]
+    fn edit_dtos_serialize_as_the_ui_expects() {
+        let (state, _c, _p) = open_stereo();
+        let dto = serde_json::to_value(state.edit(EditOp::Normalize, 0, 100).unwrap()).unwrap();
+        assert_eq!(dto["canUndo"], true);
+        assert_eq!(dto["lastUndoable"], true);
+        assert_eq!(dto["info"]["frames"], FIXTURE_FRAMES);
+        // EditOp arrives from JS as a camelCase string.
+        assert_eq!(
+            serde_json::from_str::<EditOp>("\"fadeIn\"").unwrap(),
+            EditOp::FadeIn
+        );
+        assert_eq!(
+            serde_json::from_str::<EditOp>("\"normalize\"").unwrap(),
+            EditOp::Normalize
+        );
     }
 
     #[test]
