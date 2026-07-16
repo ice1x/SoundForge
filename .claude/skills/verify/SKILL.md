@@ -58,7 +58,10 @@ A ~130-line `std::net::TcpListener` server (no HTTP deps needed) that:
   `window.__TAURI__.core.invoke = (cmd,args) => fetch('/invoke',{...})` and
   `window.__TAURI__.event.listen = async () => () => {}`,
 - `POST /invoke` dispatches to the real `AudioState`: `open_file`, `audio_info`,
-  `close_file`, `stats`, `waveform`, `frontend_log`,
+  `close_file`, `stats`, `waveform`, `frontend_log`, and — since task 14 — to a real
+  `player::Player` for `play`, `pause_playback`, `resume_playback`, `stop_playback`,
+  `playback_status` (audio really comes out of the speakers; `Player` needs no Tauri types
+  either). Mirror the shell's ordering: `open_file`/`close_file` call `player.stop()` first.
 - stubs `plugin:dialog|open` by returning a path from an env var — a **bare string**, exactly
   as the real command does (`OpenResponse::File` → untagged `FilePath` → JSON string). This
   makes the UI's real `pickFile()` → `openPath()` path run.
@@ -77,6 +80,39 @@ transport is not crossed (and the `UI booted` line above covers that).
 - A `computer` click can silently miss; `element.click()` via `javascript_tool` is reliable.
 - Wrap `window.__TAURI__.core.invoke` to count/inspect calls — that is how you prove
   coalescing and the no-redraw-on-drag rule.
+- **`requestAnimationFrame` never fires in the pane** — it reports `visibilityState:
+  'hidden'` (measured: 0 frames in 500 ms). So anything rAF-driven (the playhead loop, and
+  its button label) silently stalls, and the DOM goes stale while the backend runs on
+  correctly. Don't read that as a bug: poll `playback_status` over IPC for truth, and take a
+  `computer{action:"screenshot"}` — it forces a paint, which resumes rAF and lets the UI
+  catch up in one step.
+- `computer{action:"zoom"}` ignores its `region` and just returns the full screenshot.
+
+## Verifying playback
+
+Audio plays through the **bridge process's** default output device, so you cannot hear it —
+but you can prove it ran: `playback_status.positionFrames` advances at *exactly* real time
+(only the device clock can pace it), lands exactly on the range end, and `underruns` stays 0.
+
+**A same-rate fixture silently skips the resampler.** This Mac's default output runs at
+44.1 kHz, so a 44.1 kHz file gives `ratio == 1.0` and `Source` is a straight copy. To
+exercise resampling use an **8 kHz** fixture (no CoreAudio device does 8 k natively); make it
+**mono** and it covers mono→stereo duplication at the same time. A wrong ratio shows up as a
+wrong duration, so check it played for as long as the file is.
+
+## Proving shell wiring you cannot click
+
+`manage(...)` and `generate_handler` registration only fail **at invoke time**, and the real
+app cannot be clicked. To cross that seam, temporarily append a probe to `ui/app.js`:
+
+```js
+invoke('playback_status').then(d => sflog('info', `PROBE ok: ${JSON.stringify(d)}`))
+  .catch(e => sflog('error', `PROBE FAILED: ${e.message || e}`));
+```
+
+`cargo tauri dev` hot-reloads the UI, the result lands in `/tmp/tauri-dev.log` via the log
+bridge, and you **revert the probe immediately** (keep a backup copy first). This proves
+managed state + command registration + DTO serialization across the real WKWebView boundary.
 
 ## Use a signal with a known answer
 
