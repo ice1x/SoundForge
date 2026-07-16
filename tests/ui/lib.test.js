@@ -21,8 +21,11 @@ import {
   fmtMeta,
   fmtTime,
   hasSelection,
+  nextPlaybackAction,
   normalizeSelection,
   panBy,
+  playLabel,
+  playheadVisible,
   sampleToX,
   statsRows,
   viewToSample,
@@ -309,4 +312,54 @@ test('createCoalescer delivers the final value even under a burst', async () => 
 
   assert.equal(seen.at(-1), 99, 'the newest selection must always win');
   assert.ok(seen.length < 100, 'superseded selections must be dropped, not queued');
+});
+
+// ---------- playback transport ----------
+
+test('nextPlaybackAction toggles play and pause', () => {
+  assert.equal(nextPlaybackAction('stopped'), 'play');
+  assert.equal(nextPlaybackAction('playing'), 'pause');
+  assert.equal(nextPlaybackAction('paused'), 'resume');
+});
+
+test('nextPlaybackAction restarts after playback runs to the end', () => {
+  // `finished` is the backend's "reached the end of the selection". The button must offer
+  // play again, not a pause of a stream that no longer exists.
+  assert.equal(nextPlaybackAction('finished'), 'play');
+});
+
+test('nextPlaybackAction falls back to play for an unknown state', () => {
+  // A state the UI does not recognise must leave the transport usable rather than wedged.
+  assert.equal(nextPlaybackAction(undefined), 'play');
+  assert.equal(nextPlaybackAction('wat'), 'play');
+});
+
+test('playLabel offers a pause only while actually playing', () => {
+  assert.match(playLabel('playing'), /Пауза/);
+  for (const s of ['stopped', 'paused', 'finished', undefined]) {
+    assert.match(playLabel(s), /Играть/, `state ${s}`);
+  }
+});
+
+test('playheadVisible hides the playhead only when stopped', () => {
+  assert.equal(playheadVisible('playing'), true);
+  assert.equal(playheadVisible('paused'), true, 'a paused playhead still marks the position');
+  assert.equal(playheadVisible('finished'), true);
+  assert.equal(playheadVisible('stopped'), false);
+  assert.equal(playheadVisible(undefined), false);
+});
+
+test('the playhead maps to a pixel through the same geometry as the selection', () => {
+  // The playhead is drawn on the same overlay as the selection, so a divergence here would
+  // show as the playhead sliding out of the highlighted region.
+  const view = { start: 1000, end: 2000 };
+  assert.equal(sampleToX(1500, 800, view), 400);
+  assert.equal(sampleToX(view.start, 800, view), 0);
+  assert.equal(sampleToX(view.end, 800, view), 800);
+});
+
+test('a play request uses the selection, or the whole file when there is none', () => {
+  // The transport plays exactly what the Statistics panel describes.
+  assert.deepEqual(effectiveRange({ start: 10, end: 90 }, 500), { start: 10, end: 90 });
+  assert.deepEqual(effectiveRange({ start: 42, end: 42 }, 500), { start: 0, end: 500 });
 });

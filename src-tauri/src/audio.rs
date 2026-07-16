@@ -15,7 +15,7 @@
 //! webview; `lib.rs` holds the thin `#[tauri::command]` wrappers.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use sf_core::{decode_file, stats::RangeStats, Analyzer, DecodeError, PcmCache, Pyramid};
@@ -140,7 +140,9 @@ pub struct WaveformDto {
 /// An open audio file: the memory-mapped PCM plus its per-channel pyramids.
 struct Document {
     info: AudioInfo,
-    cache: PcmCache,
+    /// Shared so playback can hold the PCM for the life of a stream without ever taking the
+    /// document lock on the audio path. See [`AudioState::pcm`].
+    cache: Arc<PcmCache>,
     /// One pyramid per channel, built once at open time. See the module docs.
     pyramids: Vec<Pyramid>,
     cache_path: PathBuf,
@@ -219,7 +221,7 @@ impl AudioState {
         };
         let doc = Document {
             info: info.clone(),
-            cache,
+            cache: Arc::new(cache),
             pyramids,
             cache_path: cache_path.to_path_buf(),
         };
@@ -230,6 +232,21 @@ impl AudioState {
     /// Geometry of the open document, or `None` if nothing is open.
     pub fn info(&self) -> Option<AudioInfo> {
         self.lock().as_ref().map(|d| d.info.clone())
+    }
+
+    /// A shared handle on the open document's PCM, for playback (task 14).
+    ///
+    /// Taken once when a stream starts, so the audio path never touches this lock — a
+    /// selection drag holds it thousands of times a minute, and blocking the feeder thread
+    /// behind one would be an audible dropout.
+    ///
+    /// Holding this `Arc` also keeps playback safe across a `close`: the document drops and
+    /// unlinks its cache file, but the `Mmap` inside the `PcmCache` lives until the last
+    /// handle goes, and on POSIX an unlinked file stays readable while mapped.
+    pub fn pcm(&self) -> Result<Arc<PcmCache>, AudioError> {
+        let guard = self.lock();
+        let doc = guard.as_ref().ok_or(AudioError::NoDocument)?;
+        Ok(Arc::clone(&doc.cache))
     }
 
     /// Close the open document (and delete its cache file). No-op if nothing is open.
@@ -563,6 +580,40 @@ mod tests {
         // The replaced document dropped, taking its cache file with it.
         assert!(!cache_a.exists(), "previous PCM cache should be cleaned up");
         assert!(cache_b.exists());
+    }
+
+    #[test]
+    fn pcm_hands_out_the_open_documents_samples() {
+        let (state, _c) = open_sine();
+        let pcm = state.pcm().unwrap();
+        assert_eq!(pcm.channels(), 1);
+        assert_eq!(pcm.frames(), 48_000);
+        assert_eq!(pcm.sample_rate(), 48_000);
+        assert_eq!(pcm.channel(0), &sine_1k(48_000)[..]);
+        assert!(matches!(
+            AudioState::default().pcm().map(|_| ()),
+            Err(AudioError::NoDocument)
+        ));
+    }
+
+    #[test]
+    fn a_pcm_handle_outlives_the_document_it_came_from() {
+        // This is what lets playback survive the user closing the file mid-stream: the cache
+        // file is unlinked with the document, but a POSIX mapping stays valid until unmapped.
+        let src = tmp("outlive.wav");
+        let cache = tmp("outlive.pcm");
+        let _c = Cleanup(vec![src.clone(), cache.clone()]);
+        write_wav(&src, std::slice::from_ref(&vec![0.75f32; 4096]), 8000);
+
+        let state = AudioState::default();
+        state.open(&src, &cache).unwrap();
+        let pcm = state.pcm().unwrap();
+
+        state.close();
+        assert!(!cache.exists(), "the cache file should have been unlinked");
+        // The samples are still readable through the handle taken before the close.
+        assert_eq!(pcm.frames(), 4096);
+        assert!(pcm.channel(0).iter().all(|&s| s == 0.75));
     }
 
     #[test]

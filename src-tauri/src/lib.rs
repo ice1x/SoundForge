@@ -6,6 +6,11 @@
 //! commands from it in O(log N), independent of selection length. The commands here are thin
 //! wrappers so that the state logic stays unit-testable without a webview.
 //!
+//! Playback: [`player::Player`] streams a range of that same PCM to the default output
+//! device (task 14). It shares the document's samples by `Arc` rather than reading them
+//! through [`audio::AudioState`], so the audio path never contends with a selection drag for
+//! the document lock.
+//!
 //! Logging: the `tauri-plugin-log` plugin fans every `log::*` record out to stdout,
 //! a rotating file in the OS log directory, and the webview devtools console. The web
 //! UI forwards its own `console.*` output and uncaught errors here via [`frontend_log`],
@@ -15,6 +20,7 @@
 
 pub mod audio;
 pub mod cache;
+pub mod player;
 
 use std::path::PathBuf;
 
@@ -22,6 +28,7 @@ use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
 
 use audio::{AudioInfo, AudioState, StatsDto, WaveformDto};
+use player::{PlaybackDto, Player};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
 /// Returns `"pong: <msg>"`.
@@ -53,8 +60,12 @@ fn next_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn open_file(
     app: tauri::AppHandle,
     state: State<'_, AudioState>,
+    player: State<'_, Player>,
     path: String,
 ) -> Result<AudioInfo, String> {
+    // Whatever is playing belongs to the outgoing document. Stopping first also releases the
+    // device before the (slow) decode, rather than leaving a stream running through it.
+    player.stop();
     let cache = next_cache_path(&app)?;
     let info = state
         .open(std::path::Path::new(&path), &cache)
@@ -80,10 +91,13 @@ fn audio_info(state: State<'_, AudioState>) -> Option<AudioInfo> {
 
 /// Close the open document and delete its PCM cache.
 #[tauri::command]
-fn close_file(state: State<'_, AudioState>) {
+fn close_file(state: State<'_, AudioState>, player: State<'_, Player>) {
     if state.info().is_some() {
         log::info!("closing document");
     }
+    // Playback holds its own `Arc` on the PCM, so it would happily keep playing a file the
+    // user has closed. Stop it first so closing means what it says.
+    player.stop();
     state.close();
 }
 
@@ -113,6 +127,55 @@ fn waveform(
     state
         .waveform(ch, start, end, bins)
         .map_err(|e| e.to_string())
+}
+
+/// Play `[start, end)` of the open document on the default output device, replacing any
+/// current playback. The range is clamped to the document; an empty one is an error.
+#[tauri::command]
+fn play(
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    start: usize,
+    end: usize,
+) -> Result<PlaybackDto, String> {
+    let pcm = state.pcm().map_err(|e| e.to_string())?;
+    player
+        .play(pcm, start, end)
+        .inspect(|_| {
+            log::info!("playing frames [{start}, {end})");
+        })
+        .map_err(|e| {
+            log::error!("play([{start}, {end})) failed: {e}");
+            e.to_string()
+        })
+}
+
+/// Pause playback where it stands, keeping the device open. No-op when nothing is playing.
+#[tauri::command]
+fn pause_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.pause()
+}
+
+/// Resume a paused playback. No-op when nothing is playing.
+#[tauri::command]
+fn resume_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.resume()
+}
+
+/// Stop playback and release the output device.
+#[tauri::command]
+fn stop_playback(player: State<'_, Player>) -> PlaybackDto {
+    player.stop();
+    player.status()
+}
+
+/// Transport state and playhead position.
+///
+/// The UI polls this per animation frame to draw the playhead, so it is only a handful of
+/// atomic loads — it never touches the device or the document.
+#[tauri::command]
+fn playback_status(player: State<'_, Player>) -> PlaybackDto {
+    player.status()
 }
 
 /// Receive a log line from the web UI and record it through the backend logger, so that
@@ -157,6 +220,7 @@ pub fn run() {
                 .build(),
         )
         .manage(AudioState::default())
+        .manage(Player::default())
         .setup(|app| {
             log::info!(
                 "SoundForge {} starting (debug_assertions={})",
@@ -203,7 +267,12 @@ pub fn run() {
             audio_info,
             close_file,
             stats,
-            waveform
+            waveform,
+            play,
+            pause_playback,
+            resume_playback,
+            stop_playback,
+            playback_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

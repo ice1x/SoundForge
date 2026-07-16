@@ -24,6 +24,11 @@ sf-core = { path = "../crates/sf-core" }
 # `<input type="file">` cannot supply. The UI has no bundler, so it calls the plugin by its
 # raw command name (`plugin:dialog|open`) instead of importing the npm package.
 tauri-plugin-dialog = "2"
+# Playback: native audio output (CoreAudio on the Apple-Silicon target).
+cpal = "0.18"
+# Realtime-safe SPSC ring buffer between the feeder thread and the audio callback. The
+# callback must not lock, allocate or page-fault, so it only ever pops from this.
+rtrb = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # Process-liveness probe (`kill(pid, 0)`) used to reap orphaned PCM caches. Already in the

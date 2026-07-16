@@ -16,8 +16,11 @@ import {
   fmtMeta,
   fmtTime,
   hasSelection,
+  nextPlaybackAction,
   normalizeSelection,
   panBy,
+  playLabel,
+  playheadVisible,
   sampleToX,
   statsRows,
   viewToSample,
@@ -100,6 +103,10 @@ let envelopes = [];
 /// Canvas size in CSS pixels.
 let size = { w: 0, h: 0 };
 let dragging = false;
+/// Last `PlaybackDto` from the backend: what the transport is doing and where the playhead
+/// is. The backend owns this — the UI never guesses the position from a timer, because only
+/// the audio callback knows what has actually reached the device.
+let playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
 
 // ---------- error banner ----------
 
@@ -220,21 +227,41 @@ function drawEnvelope() {
 
 function drawOverlay() {
   overlayCtx.clearRect(0, 0, size.w, size.h);
-  if (!info || !hasSelection(sel)) return;
+  if (!info) return;
 
-  const x1 = sampleToX(sel.start, size.w, view);
-  const x2 = sampleToX(sel.end, size.w, view);
+  if (hasSelection(sel)) {
+    const x1 = sampleToX(sel.start, size.w, view);
+    const x2 = sampleToX(sel.end, size.w, view);
 
-  overlayCtx.fillStyle = css('--sel');
-  overlayCtx.fillRect(x1, 0, x2 - x1, size.h);
+    overlayCtx.fillStyle = css('--sel');
+    overlayCtx.fillRect(x1, 0, x2 - x1, size.h);
 
-  overlayCtx.strokeStyle = css('--amber');
+    overlayCtx.strokeStyle = css('--amber');
+    overlayCtx.lineWidth = 1;
+    overlayCtx.beginPath();
+    for (const x of [x1, x2]) {
+      overlayCtx.moveTo(Math.round(x) + 0.5, 0);
+      overlayCtx.lineTo(Math.round(x) + 0.5, size.h);
+    }
+    overlayCtx.stroke();
+  }
+
+  drawPlayhead();
+}
+
+/// The playhead, on the overlay rather than the envelope: it moves every animation frame,
+/// and the envelope must not be repainted at that rate (see `refreshEnvelope`).
+function drawPlayhead() {
+  if (!playheadVisible(playback.state)) return;
+  const x = sampleToX(playback.positionFrames, size.w, view);
+  // Zoomed in elsewhere, the playhead is simply off-screen.
+  if (x < 0 || x > size.w) return;
+
+  overlayCtx.strokeStyle = css('--green');
   overlayCtx.lineWidth = 1;
   overlayCtx.beginPath();
-  for (const x of [x1, x2]) {
-    overlayCtx.moveTo(Math.round(x) + 0.5, 0);
-    overlayCtx.lineTo(Math.round(x) + 0.5, size.h);
-  }
+  overlayCtx.moveTo(Math.round(x) + 0.5, 0);
+  overlayCtx.lineTo(Math.round(x) + 0.5, size.h);
   overlayCtx.stroke();
 }
 
@@ -275,6 +302,76 @@ function updateStats() {
     : `весь файл · ${fmtTime(durS)}`;
 }
 
+// ---------- playback ----------
+
+/// Adopt a `PlaybackDto` from the backend and reflect it on screen.
+function applyPlayback(dto) {
+  const wasClean = playback.underruns === 0;
+  playback = dto;
+  $('playBtn').textContent = playLabel(dto.state);
+  // Dropouts are inaudible in a log file but obvious in the ear; record the first one so a
+  // "playback sounds glitchy" report has evidence behind it.
+  if (wasClean && dto.underruns > 0) {
+    sflog('warn', `playback underrun: ${dto.underruns} starved callback(s)`);
+  }
+  drawOverlay();
+}
+
+/// Follow the playhead until playback stops.
+///
+/// The position is polled rather than pushed: it is a couple of atomic loads on the backend,
+/// and tying it to `requestAnimationFrame` means the UI asks exactly as often as it can draw
+/// — no faster, and not at all when the window is hidden. The loop ends by itself as soon as
+/// the state leaves `playing`, so a finished or paused transport costs nothing.
+let polling = false;
+async function followPlayhead() {
+  if (polling) return;
+  polling = true;
+  try {
+    while (playback.state === 'playing') {
+      await new Promise((r) => requestAnimationFrame(r));
+      applyPlayback(await invoke('playback_status'));
+    }
+  } catch (e) {
+    sflog('warn', 'playback_status failed:', e);
+  } finally {
+    polling = false;
+  }
+}
+
+/// The transport button: play the selection (or the whole file), or pause/resume a stream
+/// that is already running.
+async function transport() {
+  if (!info) return;
+  try {
+    const action = nextPlaybackAction(playback.state);
+    if (action === 'pause') {
+      applyPlayback(await invoke('pause_playback'));
+    } else if (action === 'resume') {
+      applyPlayback(await invoke('resume_playback'));
+      followPlayhead();
+    } else {
+      // Play exactly what the Statistics panel describes.
+      const r = effectiveRange(sel, info.frames);
+      applyPlayback(await invoke('play', { start: r.start, end: r.end }));
+      followPlayhead();
+    }
+  } catch (e) {
+    showError(`Не удалось воспроизвести: ${e.message || e}`);
+  }
+}
+
+/// Stop playback and forget the playhead. Used when the document goes away.
+async function stopPlayback() {
+  try {
+    applyPlayback(await invoke('stop_playback'));
+  } catch (e) {
+    sflog('warn', 'stop_playback failed:', e);
+    playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
+    $('playBtn').textContent = playLabel('stopped');
+  }
+}
+
 // ---------- open / close ----------
 
 async function openPath(path) {
@@ -305,6 +402,10 @@ async function openPath(path) {
   sel = { start: 0, end: 0 };
   statsCh = 0;
   envelopes = [];
+  // `open_file` stops playback of the outgoing document on the backend; mirror that here so
+  // the button and the playhead do not describe a file that is no longer open.
+  playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
+  $('playBtn').textContent = playLabel(playback.state);
 
   buildChannelSelector();
   setDocumentControlsEnabled(true);
@@ -330,12 +431,15 @@ function buildChannelSelector() {
 }
 
 function setDocumentControlsEnabled(on) {
-  for (const id of ['selAllBtn', 'clrSelBtn', 'fitBtn', 'zoomSelBtn', 'closeBtn']) {
+  for (const id of ['playBtn', 'selAllBtn', 'clrSelBtn', 'fitBtn', 'zoomSelBtn', 'closeBtn']) {
     $(id).disabled = !on;
   }
 }
 
 async function closeFile() {
+  // Before `close_file`, so the transport is already down when the document goes: playback
+  // holds its own handle on the samples and would otherwise keep playing a closed file.
+  await stopPlayback();
   await invoke('close_file').catch((e) => sflog('warn', 'close_file failed:', e));
   info = null;
   envelopes = [];
@@ -453,6 +557,7 @@ wrap.addEventListener(
 
 $('openBtn').addEventListener('click', pickFile);
 $('closeBtn').addEventListener('click', closeFile);
+$('playBtn').addEventListener('click', transport);
 $('selAllBtn').addEventListener('click', selectAll);
 $('clrSelBtn').addEventListener('click', clearSel);
 $('fitBtn').addEventListener('click', () => info && setView(fitView(info.frames)));
@@ -469,6 +574,12 @@ window.addEventListener('keydown', (e) => {
     selectAll();
   }
   if (e.key === 'Escape') clearSel();
+  if (e.key === ' ') {
+    // Otherwise the browser scrolls, and a focused button would fire its click too — which
+    // would toggle the transport twice.
+    e.preventDefault();
+    transport();
+  }
 });
 
 let resizeTimer = null;

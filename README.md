@@ -46,10 +46,31 @@ The web UI calls these via `invoke()` (see `src-tauri/src/lib.rs`):
 | `close_file` | — | — (releases the document and deletes its cache) |
 | `stats` | `ch`, `start`, `end` | `StatsDto` — seamless selection statistics, O(log N) |
 | `waveform` | `ch`, `start`, `end`, `bins` | `WaveformDto` — parallel `min`/`max` arrays, one entry per pixel |
+| `play` | `start`, `end` | `PlaybackDto` — plays that range on the default output device |
+| `pause_playback` | — | `PlaybackDto` |
+| `resume_playback` | — | `PlaybackDto` |
+| `stop_playback` | — | `PlaybackDto` |
+| `playback_status` | — | `PlaybackDto` — transport state + playhead (polled per animation frame) |
 
 Ranges are half-open and clamped to the document; an empty selection yields zeroed stats.
 Values are **linear** — dB formatting stays in the UI (as in the `miniforge.html` prototype),
 which also keeps the JSON free of non-finite floats.
+
+### Playback
+
+`play` streams the range straight off the memory-mapped PCM cache — the same bytes `stats`
+reads, with no second copy of the audio. The path is deliberately shaped around one rule:
+**the audio callback must never block**. Reading an `mmap` can page-fault, so the callback
+only ever pops from a lock-free `rtrb` ring that a feeder thread keeps full, and the feeder
+holds an `Arc` on the PCM rather than the document lock — a selection drag takes that lock
+thousands of times a minute, and waiting on it would be an audible dropout.
+
+`Source` does the two conversions a real device needs: channel mapping (mono duplicated to
+both speakers, stereo downmixed for a mono device) and resampling when the device cannot run
+at the file's rate. `PlaybackDto.positionFrames` is the playhead in **source** frames, derived
+from what has actually reached the device — not from what the feeder has queued, which runs
+up to 250 ms ahead of the sound. `underruns` counts starved callbacks; non-zero means audible
+dropouts. See `src-tauri/src/player.rs`.
 
 ### PCM cache files
 
@@ -88,6 +109,12 @@ Never request more bins than the view has samples (`binsForView`): the backend f
 containing no sample with `(0, 0)`, so asking for a bin per pixel while zoomed in past one
 sample per pixel makes the envelope collapse onto the zero line and vanish.
 
+The playhead follows the same two rules: it is drawn on the overlay (never the envelope), and
+its position is **polled** from `playback_status` on `requestAnimationFrame` rather than
+pushed — so the UI asks exactly as often as it can paint, and not at all while the window is
+hidden. The position always comes from the backend; the UI never extrapolates it from a
+timer, because only the audio callback knows what has actually been heard.
+
 Opening a file needs a real filesystem path, which the webview's `<input type="file">` cannot
 give, so the shell registers `tauri-plugin-dialog`. The project has no JS bundler, so the UI
 calls the plugin by its raw command name (`invoke('plugin:dialog|open', …)`) rather than
@@ -96,8 +123,11 @@ importing the plugin's npm package. The capability grants `dialog:allow-open` an
 `plugin:dialog|message`, so leaving that ungranted would turn any stray `alert()` into an
 opaque permission error.
 
-Playback, recording, edits and export are backend features (tasks 14–17); their controls are
-present but disabled, each labelled with the task that will land it.
+The transport plays exactly what the Statistics panel describes: the selection, or the whole
+file when there is none. Play/pause is the `playBtn` toggle or the space bar.
+
+Recording, edits and export are still backend features; their controls are present but
+disabled, each labelled with what will land it.
 
 ## Layout
 
@@ -106,7 +136,7 @@ SoundForge/
 ├─ Cargo.toml            # workspace
 ├─ package.json          # ui/ test harness only (no deps, no build step)
 ├─ crates/sf-core/       # pure-Rust analysis core (no GUI / no audio hardware; fully unit-tested)
-├─ src-tauri/            # Tauri shell (depends on sf-core): IPC commands + audio document state
+├─ src-tauri/            # Tauri shell (depends on sf-core): IPC commands, audio document state, playback
 ├─ tests/ui/             # unit tests for ui/lib.js (node --test)
 └─ ui/                   # web UI ported from miniforge.html
 ```
@@ -160,7 +190,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
 - [x] 12 — Reap orphaned PCM caches (`cache`) — startup sweep of caches left by an instance that died without running `Drop`
 - [x] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
-- [ ] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
+- [x] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
 - [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
 - [ ] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
 - [ ] 17 — WAV export (`hound`) of selection or whole file

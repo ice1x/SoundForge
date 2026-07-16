@@ -137,6 +137,27 @@ export function statsRows(dto) {
   return rows.map(([k, v, u, hi]) => ({ k, v, u, hi }));
 }
 
+/// What the transport button does next, given the backend's playback state.
+///
+/// `finished` (ran to the end of the selection) and `stopped` both restart from the
+/// selection, which is why the backend distinguishes them but this does not.
+export function nextPlaybackAction(state) {
+  if (state === 'playing') return 'pause';
+  if (state === 'paused') return 'resume';
+  return 'play';
+}
+
+/// The transport button's label. Only an active stream offers a pause.
+export function playLabel(state) {
+  return state === 'playing' ? '⏸ Пауза' : '▶ Играть';
+}
+
+/// Whether the playhead should be drawn. A stopped transport has no position to show; a
+/// paused or finished one does.
+export function playheadVisible(state) {
+  return state === 'playing' || state === 'paused' || state === 'finished';
+}
+
 /// Run `fn` with at most one call in flight, always finishing with the newest arguments.
 ///
 /// A selection drag fires mouse-moves far faster than an IPC round-trip completes. Awaiting
