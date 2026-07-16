@@ -1,6 +1,9 @@
 # Rust / Cargo build artifacts
 /target
 
+# Node: the ui/ tests need no dependencies, but package.json invites `npm install`
+/node_modules
+
 # Tauri generated schemas
 /src-tauri/gen/schemas
 

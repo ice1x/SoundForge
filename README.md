@@ -14,7 +14,7 @@ Native desktop app; macOS / Apple Silicon now, cross-platform (Windows/Linux) la
 | Layer | Technology |
 |---|---|
 | Shell / window | **Tauri v2** (system WebView, native `.app`/`.dmg`, web↔Rust IPC) |
-| UI | Existing `miniforge.html` design (vanilla JS + Canvas) ported to call Rust via IPC |
+| UI | `miniforge.html` design (vanilla JS + Canvas, no build step) calling Rust via IPC — see [Web UI](#web-ui) |
 | Audio core | **Rust** — `sf-core`: decode, summary pyramid, statistics, edits |
 | Decode | `symphonia` (WAV/FLAC/MP3/AAC/OGG/ALAC, streaming) |
 | WAV I/O | `hound` |
@@ -60,21 +60,65 @@ running `Drop` (SIGKILL, force-quit, `panic=abort`) would leak one permanently. 
 that, startup sweeps the cache directory and reaps caches whose owning process is gone; a
 concurrently running instance's caches are left alone. See `src-tauri/src/cache.rs`.
 
+## Web UI
+
+`ui/` is the `miniforge.html` design ported onto the IPC commands above. It holds **no
+samples**: the document lives in Rust, and the UI only asks for what it needs to paint —
+`waveform` for the envelope of the visible range, `stats` for the current selection. That is
+what makes a multi-hour file behave like a short one.
+
+| File | Role |
+|---|---|
+| `ui/index.html` | Markup + styles only |
+| `ui/lib.js` | Pure logic — formatting, dB conversion, view/pixel geometry, request coalescing. No DOM, no IPC, so it is unit-tested under plain Node |
+| `ui/app.js` | DOM + IPC wiring (the part that needs a real webview) |
+
+Two rules keep a selection drag at 60 fps, and both are load-bearing:
+
+1. **The envelope is only refetched when the view changes** (zoom/scroll/resize) — never per
+   drag frame. A full-width `waveform` redraw costs one range query per bin (~4 ms), while a
+   `stats` query is ~1.2 µs. The selection lives on its own overlay canvas stacked above the
+   envelope, so dragging repaints only the overlay. A 200-mouse-move drag issues **zero**
+   `waveform` calls.
+2. **Stats requests are coalesced** (`createCoalescer`): at most one in flight, always
+   finishing with the newest selection. Superseded requests are dropped rather than queued,
+   so the panel cannot lag behind the cursor. A 200-mouse-move drag issues **2** `stats` calls.
+
+Never request more bins than the view has samples (`binsForView`): the backend fills a bin
+containing no sample with `(0, 0)`, so asking for a bin per pixel while zoomed in past one
+sample per pixel makes the envelope collapse onto the zero line and vanish.
+
+Opening a file needs a real filesystem path, which the webview's `<input type="file">` cannot
+give, so the shell registers `tauri-plugin-dialog`. The project has no JS bundler, so the UI
+calls the plugin by its raw command name (`invoke('plugin:dialog|open', …)`) rather than
+importing the plugin's npm package. The capability grants `dialog:allow-open` and also
+`dialog:allow-message` — the plugin unconditionally rewires `window.alert` to
+`plugin:dialog|message`, so leaving that ungranted would turn any stray `alert()` into an
+opaque permission error.
+
+Playback, recording, edits and export are backend features (tasks 14–17); their controls are
+present but disabled, each labelled with the task that will land it.
+
 ## Layout
 
 ```
 SoundForge/
 ├─ Cargo.toml            # workspace
+├─ package.json          # ui/ test harness only (no deps, no build step)
 ├─ crates/sf-core/       # pure-Rust analysis core (no GUI / no audio hardware; fully unit-tested)
 ├─ src-tauri/            # Tauri shell (depends on sf-core): IPC commands + audio document state
+├─ tests/ui/             # unit tests for ui/lib.js (node --test)
 └─ ui/                   # web UI ported from miniforge.html
 ```
 
 ## Development
 
 - Test-Driven Development: write failing tests first, then implement, then integration tests.
-- Everything must be green before moving on: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`.
-- **All documentation and docstrings are in English only.**
+- Everything must be green before moving on: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `npm test`.
+- **All documentation and docstrings are in English only.** (User-facing UI copy stays in the
+  prototype's language.)
+- The UI tests need Node 18+ and nothing else — `npm test` runs `node --test` over `tests/ui/`;
+  there are no dependencies to install and no build step.
 
 ### Build script
 
@@ -84,7 +128,8 @@ list; the most useful commands are:
 
 | Command | What it does |
 |---|---|
-| `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` — the gate that must be green before pushing (mirrors CI) |
+| `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` + the `ui/` tests — the gate that must be green before pushing (mirrors CI) |
+| `scripts/build.sh ui` | just the `ui/` tests (`node --test`) |
 | `scripts/build.sh release` | optimized release build of the whole workspace (default) |
 | `scripts/build.sh app` | bundle the native `.app`/`.dmg` via `cargo tauri build` |
 | `scripts/build.sh dev` | run the app in watch mode via `cargo tauri dev` |
@@ -114,7 +159,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
 - [x] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
 - [x] 12 — Reap orphaned PCM caches (`cache`) — startup sweep of caches left by an instance that died without running `Drop`
-- [ ] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
+- [x] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
 - [ ] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
 - [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
 - [ ] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache

@@ -20,6 +20,10 @@ log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 sf-core = { path = "../crates/sf-core" }
+# Native file picker. `open_file` needs a real filesystem path, which the webview's
+# `<input type="file">` cannot supply. The UI has no bundler, so it calls the plugin by its
+# raw command name (`plugin:dialog|open`) instead of importing the npm package.
+tauri-plugin-dialog = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Process-liveness probe (`kill(pid, 0)`) used to reap orphaned PCM caches. Already in the

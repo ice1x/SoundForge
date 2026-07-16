@@ -138,6 +138,9 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        // Native file picker. `open_file` needs a real filesystem path, which the webview's
+        // `<input type="file">` cannot supply — it only yields an opaque `File` handle.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(level)
