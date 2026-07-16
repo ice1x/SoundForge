@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SoundForge — редактор со статистикой из коробки</title>
+<title>SoundForge — the audio editor with statistics out of the box</title>
 <style>
   :root{
     --bg:#0b0d10;
@@ -108,16 +108,13 @@
 <body>
 <header>
   <div class="logo"><b>Sound</b>Forge</div>
-  <div class="meta" id="fileMeta">нет файла</div>
+  <div class="meta" id="fileMeta">no file</div>
   <div class="spacer"></div>
   <div class="toolbar">
-    <button id="openBtn">Открыть файл…</button>
-    <button id="closeBtn" disabled>Закрыть</button>
-    <!-- Playback, recording, edits and export are backend features still to come; the
-         controls are shown disabled so the layout matches the target design. Deliberately
-         no task numbers here: the README renumbers tasks whenever one is inserted. -->
-    <button id="recBtn" class="rec" disabled title="Нативная запись — пока не реализована">● Запись</button>
-    <button id="saveBtn" class="primary" disabled title="Экспорт WAV — пока не реализован">Сохранить WAV</button>
+    <button id="openBtn">Open file…</button>
+    <button id="closeBtn" disabled>Close</button>
+    <button id="recBtn" class="rec" disabled title="Record from an input device">● Record</button>
+    <button id="saveBtn" class="primary" disabled title="Export the selection (or the whole file) to WAV">Save WAV</button>
   </div>
 </header>
 
@@ -129,39 +126,39 @@
       <canvas id="wave"></canvas>
       <canvas id="overlay"></canvas>
       <div class="drop-hint" id="hint">
-        <b>Перетащи сюда аудиофайл</b>
-        <span>или нажми «Открыть файл…»</span>
-        <span class="kbd">выдели мышкой участок → статистика справа считается сама</span>
-        <span class="kbd">колесо — масштаб, shift+колесо — прокрутка</span>
+        <b>Drop an audio file here</b>
+        <span>or press “Open file…”</span>
+        <span class="kbd">drag out a selection → the statistics on the right follow it live</span>
+        <span class="kbd">wheel to zoom, shift+wheel to scroll</span>
       </div>
     </div>
 
     <div class="transport">
-      <button id="playBtn" disabled title="Играть выделение (или весь файл) — пробел">▶ Играть</button>
-      <button id="selAllBtn" disabled>Выделить всё</button>
-      <button id="clrSelBtn" disabled>Снять выделение</button>
-      <button id="fitBtn" disabled>Весь файл</button>
-      <button id="zoomSelBtn" disabled>Масштаб по выделению</button>
+      <button id="playBtn" disabled title="Play the selection (or the whole file) — space">▶ Play</button>
+      <button id="selAllBtn" disabled>Select all</button>
+      <button id="clrSelBtn" disabled>Clear selection</button>
+      <button id="fitBtn" disabled>Whole file</button>
+      <button id="zoomSelBtn" disabled>Zoom to selection</button>
       <span class="time" id="timeReadout">—</span>
     </div>
 
     <div class="edits">
-      <button disabled class="ed" title="Правки — пока не реализованы">Нормализовать</button>
-      <button disabled class="ed" title="Правки — пока не реализованы">Fade In</button>
-      <button disabled class="ed" title="Правки — пока не реализованы">Fade Out</button>
-      <button disabled class="ed" title="Правки — пока не реализованы">Тишина</button>
-      <button disabled class="ed" title="Правки — пока не реализованы">Обрезать до выделения</button>
-      <button disabled id="undoBtn" title="Отмена правок — пока не реализована">↶ Отменить</button>
+      <button id="normBtn" disabled class="ed">Normalize</button>
+      <button id="fadeInBtn" disabled class="ed">Fade In</button>
+      <button id="fadeOutBtn" disabled class="ed">Fade Out</button>
+      <button id="silenceBtn" disabled class="ed">Silence</button>
+      <button id="trimBtn" disabled class="ed">Trim to selection</button>
+      <button id="undoBtn" disabled>↶ Undo</button>
     </div>
   </div>
 
   <div class="right">
     <div class="stat-head"><span>Statistics</span><span class="live">live</span></div>
-    <div class="chrow"><span>Канал</span><select id="chSel" disabled></select></div>
+    <div class="chrow"><span>Channel</span><select id="chSel" disabled></select></div>
     <div class="stats" id="statsBody">
-      <div class="row"><span class="k">Загрузи звук, чтобы увидеть цифры</span></div>
+      <div class="row"><span class="k">Open a sound to see the numbers</span></div>
     </div>
-    <div class="scope-note" id="scopeNote">Область: —</div>
+    <div class="scope-note" id="scopeNote">Scope: —</div>
   </div>
 </div>
 

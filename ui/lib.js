@@ -120,19 +120,19 @@ export function fmtMeta(name, info) {
 /// prototype; `hi` marks the headline figures.
 export function statsRows(dto) {
   const rows = [
-    ['Длина выделения', fmtTime(dto.durationS), '', false],
-    ['Сэмплов', fmtCount(dto.n), '', false],
-    ['Позиция начала', fmtTime(dto.startS), '', false],
-    ['Пик (Peak)', db(dto.peak), 'dB', true],
-    ['Макс. сэмпл', db(Math.abs(dto.max)), 'dB', false],
-    ['Позиция макс.', fmtTime(dto.maxPosS), '', false],
-    ['Мин. сэмпл', db(Math.abs(dto.min)), 'dB', false],
-    ['Позиция мин.', fmtTime(dto.minPosS), '', false],
+    ['Selection length', fmtTime(dto.durationS), '', false],
+    ['Samples', fmtCount(dto.n), '', false],
+    ['Start position', fmtTime(dto.startS), '', false],
+    ['Peak', db(dto.peak), 'dB', true],
+    ['Max sample', db(Math.abs(dto.max)), 'dB', false],
+    ['Max position', fmtTime(dto.maxPosS), '', false],
+    ['Min sample', db(Math.abs(dto.min)), 'dB', false],
+    ['Min position', fmtTime(dto.minPosS), '', false],
     ['RMS', db(dto.rms), 'dB', true],
-    ['Среднее (DC offset)', dto.dc.toFixed(6), '', false],
+    ['Mean (DC offset)', dto.dc.toFixed(6), '', false],
     ['DC offset', db(Math.abs(dto.dc)), 'dB', false],
-    ['Пересечения нуля', fmtCount(dto.zeroCrossings), '', false],
-    ['Частота (zero-cross)', dto.freqHz.toFixed(1), 'Hz', true],
+    ['Zero crossings', fmtCount(dto.zeroCrossings), '', false],
+    ['Frequency (zero-cross)', dto.freqHz.toFixed(1), 'Hz', true],
   ];
   return rows.map(([k, v, u, hi]) => ({ k, v, u, hi }));
 }
@@ -149,7 +149,7 @@ export function nextPlaybackAction(state) {
 
 /// The transport button's label. Only an active stream offers a pause.
 export function playLabel(state) {
-  return state === 'playing' ? '⏸ Пауза' : '▶ Играть';
+  return state === 'playing' ? '⏸ Pause' : '▶ Play';
 }
 
 /// Whether the playhead should be drawn. A stopped transport has no position to show; a

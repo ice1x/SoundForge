@@ -215,7 +215,7 @@ const DTO = {
 test('statsRows converts the linear DTO to dB in the UI', () => {
   const rows = statsRows(DTO);
   const byKey = Object.fromEntries(rows.map((r) => [r.k, r.v]));
-  assert.equal(byKey['Пик (Peak)'], '-6.02'); // db(0.5)
+  assert.equal(byKey['Peak'], '-6.02'); // db(0.5)
   assert.equal(byKey['RMS'], '-12.04'); // db(0.25)
 });
 
@@ -223,8 +223,8 @@ test('statsRows uses absolute values for min/max in dB', () => {
   // dB of a negative sample is meaningless; the magnitude is what is shown.
   const rows = statsRows({ ...DTO, min: -0.5, max: 0.25 });
   const byKey = Object.fromEntries(rows.map((r) => [r.k, r.v]));
-  assert.equal(byKey['Мин. сэмпл'], '-6.02');
-  assert.equal(byKey['Макс. сэмпл'], '-12.04');
+  assert.equal(byKey['Min sample'], '-6.02');
+  assert.equal(byKey['Max sample'], '-12.04');
 });
 
 test('statsRows survives a zeroed (silent / empty) selection without producing NaN', () => {
@@ -244,7 +244,7 @@ test('statsRows survives a zeroed (silent / empty) selection without producing N
 test('statsRows highlights the headline figures', () => {
   const rows = statsRows(DTO);
   const hi = rows.filter((r) => r.hi).map((r) => r.k);
-  assert.deepEqual(hi, ['Пик (Peak)', 'RMS', 'Частота (zero-cross)']);
+  assert.deepEqual(hi, ['Peak', 'RMS', 'Frequency (zero-cross)']);
 });
 
 test('statsRows renders every value as a string', () => {
@@ -335,9 +335,9 @@ test('nextPlaybackAction falls back to play for an unknown state', () => {
 });
 
 test('playLabel offers a pause only while actually playing', () => {
-  assert.match(playLabel('playing'), /Пауза/);
+  assert.match(playLabel('playing'), /Pause/);
   for (const s of ['stopped', 'paused', 'finished', undefined]) {
-    assert.match(playLabel(s), /Играть/, `state ${s}`);
+    assert.match(playLabel(s), /Play/, `state ${s}`);
   }
 });
 

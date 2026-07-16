@@ -145,8 +145,9 @@ SoundForge/
 
 - Test-Driven Development: write failing tests first, then implement, then integration tests.
 - Everything must be green before moving on: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `npm test`.
-- **All documentation and docstrings are in English only.** (User-facing UI copy stays in the
-  prototype's language.)
+- **English only — including user-facing UI copy.** This supersedes the earlier rule that let
+  UI strings stay in the `miniforge.html` prototype's language: the prototype was Russian, the
+  port inherited that, and the product is English. `ui/` must contain no non-English copy.
 - The UI tests need Node 18+ and nothing else — `npm test` runs `node --test` over `tests/ui/`;
   there are no dependencies to install and no build step.
 

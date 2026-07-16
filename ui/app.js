@@ -168,7 +168,7 @@ const refreshEnvelope = createCoalescer(async () => {
     Array.from({ length: info.channels }, (_, ch) => invoke('waveform', { ch, start, end, bins })),
   );
   drawEnvelope();
-}, (e) => showError(`Не удалось построить волну: ${e.message || e}`));
+}, (e) => showError(`Could not draw the waveform: ${e.message || e}`));
 
 function drawEnvelope() {
   waveCtx.clearRect(0, 0, size.w, size.h);
@@ -270,7 +270,7 @@ function drawPlayhead() {
 const requestStats = createCoalescer(async (ch, start, end) => {
   const dto = await invoke('stats', { ch, start, end });
   renderStats(dto);
-}, (e) => showError(`Не удалось посчитать статистику: ${e.message || e}`));
+}, (e) => showError(`Could not compute statistics: ${e.message || e}`));
 
 function renderStats(dto) {
   $('statsBody').innerHTML = statsRows(dto)
@@ -295,11 +295,11 @@ function updateStats() {
   const durS = (r.end - r.start) / sr;
 
   $('scopeNote').textContent = hasSelection(sel)
-    ? `Область: выделение ${fmtTime(startS)} – ${fmtTime(endS)}`
-    : 'Область: весь файл (выдели участок мышкой для локальной статистики)';
+    ? `Scope: selection ${fmtTime(startS)} – ${fmtTime(endS)}`
+    : 'Scope: whole file (drag out a selection for local statistics)';
   $('timeReadout').textContent = hasSelection(sel)
     ? `${fmtTime(startS)} → ${fmtTime(endS)}  (${fmtTime(durS)})`
-    : `весь файл · ${fmtTime(durS)}`;
+    : `whole file · ${fmtTime(durS)}`;
 }
 
 // ---------- playback ----------
@@ -357,7 +357,7 @@ async function transport() {
       followPlayhead();
     }
   } catch (e) {
-    showError(`Не удалось воспроизвести: ${e.message || e}`);
+    showError(`Could not play: ${e.message || e}`);
   }
 }
 
@@ -377,7 +377,7 @@ async function stopPlayback() {
 async function openPath(path) {
   clearError();
   const prevMeta = $('fileMeta').textContent;
-  $('fileMeta').textContent = 'открываю…';
+  $('fileMeta').textContent = 'opening…';
 
   let opened;
   try {
@@ -389,7 +389,7 @@ async function openPath(path) {
     // half-clearing the UI: dropping `info` here would leave a stale waveform on screen,
     // controls enabled but inert, and the two sides disagreeing about what is open.
     $('fileMeta').textContent = prevMeta;
-    showError(`Не удалось открыть файл: ${e.message || e}`);
+    showError(`Could not open the file: ${e.message || e}`);
     return;
   }
   info = opened;
@@ -423,7 +423,7 @@ function buildChannelSelector() {
   for (let ch = 0; ch < info.channels; ch++) {
     const o = document.createElement('option');
     o.value = String(ch);
-    o.textContent = info.channels === 1 ? 'моно' : `канал ${ch + 1}`;
+    o.textContent = info.channels === 1 ? 'mono' : `channel ${ch + 1}`;
     s.appendChild(o);
   }
   s.value = '0';
@@ -448,9 +448,9 @@ async function closeFile() {
   const chSel = $('chSel');
   chSel.innerHTML = '';
   chSel.disabled = true;
-  $('fileMeta').textContent = 'нет файла';
-  $('statsBody').innerHTML = '<div class="row"><span class="k">Загрузи звук, чтобы увидеть цифры</span></div>';
-  $('scopeNote').textContent = 'Область: —';
+  $('fileMeta').textContent = 'no file';
+  $('statsBody').innerHTML = '<div class="row"><span class="k">Open a sound to see the numbers</span></div>';
+  $('scopeNote').textContent = 'Scope: —';
   $('timeReadout').textContent = '—';
   $('hint').style.display = '';
   fitCanvases();
@@ -465,12 +465,12 @@ async function pickFile() {
   try {
     const path = await invoke('plugin:dialog|open', {
       options: {
-        title: 'Открыть аудиофайл',
+        title: 'Open an audio file',
         multiple: false,
         directory: false,
         filters: [
           {
-            name: 'Аудио',
+            name: 'Audio',
             extensions: ['wav', 'wave', 'flac', 'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'aiff', 'aif', 'caf', 'alac', 'mkv', 'webm'],
           },
         ],
@@ -478,7 +478,7 @@ async function pickFile() {
     });
     if (path) await openPath(path);
   } catch (e) {
-    showError(`Не удалось открыть диалог выбора файла: ${e.message || e}`);
+    showError(`Could not open the file picker: ${e.message || e}`);
   }
 }
 
