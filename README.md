@@ -51,6 +51,15 @@ Ranges are half-open and clamped to the document; an empty selection yields zero
 Values are **linear** — dB formatting stays in the UI (as in the `miniforge.html` prototype),
 which also keeps the JSON free of non-finite floats.
 
+### PCM cache files
+
+`open_file` decodes into a cache file (`pcm-<pid>-<counter>.cache`) in the app cache
+directory, memory-maps it, and deletes it when the document is closed or replaced. Those
+files are large — roughly 1.2 GB for a 2-hour source — so an instance that dies without
+running `Drop` (SIGKILL, force-quit, `panic=abort`) would leak one permanently. To prevent
+that, startup sweeps the cache directory and reaps caches whose owning process is gone; a
+concurrently running instance's caches are left alone. See `src-tauri/src/cache.rs`.
+
 ## Layout
 
 ```
@@ -104,10 +113,11 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 9 — Build script (`scripts/build.sh`) — one entry point for `check`/`build`/`release`/`app`/`dev`/`clean`, mirroring the CI "everything green" gate locally
 - [x] 10 — `decode` — `symphonia` → on-disk PCM cache opened via `memmap2` (multi-channel)
 - [x] 11 — Wire `Analyzer` over the mmap'd PCM; `stats`/`waveform` IPC commands
-- [ ] 12 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
-- [ ] 13 — Playback (`cpal` output + `rtrb` ring buffer), play selection
-- [ ] 14 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
-- [ ] 15 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
-- [ ] 16 — WAV export (`hound`) of selection or whole file
-- [ ] 17 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
-- [ ] 18 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
+- [x] 12 — Reap orphaned PCM caches (`cache`) — startup sweep of caches left by an instance that died without running `Drop`
+- [ ] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
+- [ ] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
+- [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
+- [ ] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
+- [ ] 17 — WAV export (`hound`) of selection or whole file
+- [ ] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
+- [ ] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon

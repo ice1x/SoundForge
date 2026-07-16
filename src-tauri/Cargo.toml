@@ -21,6 +21,11 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 sf-core = { path = "../crates/sf-core" }
 
+[target.'cfg(unix)'.dependencies]
+# Process-liveness probe (`kill(pid, 0)`) used to reap orphaned PCM caches. Already in the
+# tree via tauri, so this costs no extra build.
+libc = "0.2"
+
 [dev-dependencies]
 # Synthesize deterministic WAV fixtures for the audio state tests.
 hound = "3"
