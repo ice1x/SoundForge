@@ -1236,22 +1236,24 @@ mod tests {
         }
     }
 
-    /// The one test that needs real hardware: it opens the default output device and plays a
-    /// short, quiet tone. Skipped where there is no device (CI runners have none), which is
-    /// why every decision above is tested separately against plain data.
+    /// The one test that needs real hardware: it opens the default output device and streams
+    /// through it. Skipped where there is no device (CI runners have none), which is why
+    /// every decision above is tested separately against plain data.
+    ///
+    /// It plays SILENCE on purpose. What this test checks is transport mechanics — that the
+    /// device consumes frames at its own clock and the range reaches its end — and silence
+    /// proves that just as well as a tone. What is actually *in* the frames is settled by the
+    /// `Source` tests above, against plain data. A test suite must not make a noise on the
+    /// developer's speakers every time it runs.
     #[test]
     fn playback_on_a_real_device_runs_to_the_end() {
         if cpal::default_host().default_output_device().is_none() {
             eprintln!("skipping: no output device on this machine");
             return;
         }
-        // 200 ms of a quiet 440 Hz tone.
         let sr = 48_000;
-        let n = sr / 5;
-        let tone: Vec<f32> = (0..n)
-            .map(|i| 0.05 * (2.0 * PI * 440.0 * i as f32 / sr as f32).sin())
-            .collect();
-        let (cache, _c) = pcm(&[tone.clone(), tone], sr as u32);
+        let n = sr / 5; // 200 ms
+        let (cache, _c) = pcm(&[vec![0.0f32; n], vec![0.0f32; n]], sr as u32);
 
         let p = Player::default();
         let started = match p.play(Arc::clone(&cache), 0, n) {
