@@ -16,6 +16,7 @@ import {
   createCoalescer,
   db,
   effectiveRange,
+  exportFileName,
   fitView,
   fmtCount,
   fmtMeta,
@@ -192,6 +193,32 @@ test('fmtMeta summarises the document geometry', () => {
   assert.match(s, /48000 Hz/);
   assert.match(s, /2 ch/);
   assert.match(s, /2\.000 s/);
+});
+
+// ---------- exportFileName ----------
+
+test('exportFileName swaps the source extension for .wav', () => {
+  assert.equal(exportFileName('song.mp3', false), 'song.wav');
+  assert.equal(exportFileName('take.flac', false), 'take.wav');
+});
+
+test('exportFileName marks a selection export', () => {
+  assert.equal(exportFileName('song.mp3', true), 'song-selection.wav');
+});
+
+test('exportFileName suffixes a .wav source so it cannot propose overwriting it', () => {
+  assert.equal(exportFileName('master.wav', false), 'master.wav');
+  assert.equal(exportFileName('master.wav', true), 'master-selection.wav');
+});
+
+test('exportFileName falls back to a default when there is no name', () => {
+  assert.equal(exportFileName('', false), 'audio.wav');
+  assert.equal(exportFileName(undefined, false), 'audio.wav');
+  assert.equal(exportFileName('.hidden', false), 'audio.wav');
+});
+
+test('exportFileName keeps dotted stems intact', () => {
+  assert.equal(exportFileName('my.mix.v2.aiff', false), 'my.mix.v2.wav');
 });
 
 // ---------- statsRows ----------

@@ -12,6 +12,7 @@ import {
   binsForView,
   createCoalescer,
   effectiveRange,
+  exportFileName,
   fitView,
   fmtMeta,
   fmtTime,
@@ -511,7 +512,7 @@ function buildChannelSelector() {
 }
 
 function setDocumentControlsEnabled(on) {
-  for (const id of ['playBtn', 'selAllBtn', 'clrSelBtn', 'fitBtn', 'zoomSelBtn', 'closeBtn']) {
+  for (const id of ['playBtn', 'selAllBtn', 'clrSelBtn', 'fitBtn', 'zoomSelBtn', 'closeBtn', 'saveBtn']) {
     $(id).disabled = !on;
   }
 }
@@ -561,6 +562,34 @@ async function pickFile() {
     if (path) await openPath(path);
   } catch (e) {
     showError(`Could not open the file picker: ${e.message || e}`);
+  }
+}
+
+/// Export the selection (or the whole file when there is none) to WAV. Asks for a
+/// destination through the native save dialog, then hands the byte-writing to the backend,
+/// which reads straight from the memory-mapped PCM — no samples pass through the UI.
+///
+/// Writes 16-bit PCM: the universally-playable interchange format, which is what "Save WAV"
+/// conventionally means. The backend also supports lossless 32-bit float; a format picker can
+/// surface that later.
+async function saveFile() {
+  if (!info) return;
+  clearError();
+  const r = effectiveRange(sel, info.frames);
+  try {
+    const path = await invoke('plugin:dialog|save', {
+      options: {
+        title: 'Export to WAV',
+        defaultPath: exportFileName(currentName, hasSelection(sel)),
+        filters: [{ name: 'WAV audio', extensions: ['wav'] }],
+      },
+    });
+    // The user cancelled the dialog: not an error, just nothing to do.
+    if (!path) return;
+    const dto = await invoke('export', { path, start: r.start, end: r.end, format: 'pcm16' });
+    sflog('info', `exported ${dto.frames} frames to ${dto.path}`);
+  } catch (e) {
+    showError(`Could not export: ${e.message || e}`);
   }
 }
 
@@ -639,6 +668,7 @@ wrap.addEventListener(
 
 $('openBtn').addEventListener('click', pickFile);
 $('closeBtn').addEventListener('click', closeFile);
+$('saveBtn').addEventListener('click', saveFile);
 $('playBtn').addEventListener('click', transport);
 $('normBtn').addEventListener('click', () => runEdit('normalize'));
 $('fadeInBtn').addEventListener('click', () => runEdit('fadeIn'));
@@ -665,6 +695,11 @@ window.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
     e.preventDefault();
     runUndo();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    // Otherwise WKWebView offers to save the page HTML.
+    e.preventDefault();
+    saveFile();
   }
   if (e.key === ' ') {
     // Otherwise the browser scrolls, and a focused button would fire its click too — which

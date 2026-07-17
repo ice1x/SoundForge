@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use tauri::{Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
 
-use audio::{AudioInfo, AudioState, EditDto, EditOp, StatsDto, WaveformDto};
+use audio::{
+    AudioInfo, AudioState, EditDto, EditOp, ExportDto, ExportFormat, StatsDto, WaveformDto,
+};
 use player::{PlaybackDto, Player};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
@@ -178,6 +180,29 @@ fn undo(state: State<'_, AudioState>, player: State<'_, Player>) -> Result<EditD
     state.undo().map_err(|e| e.to_string())
 }
 
+/// Write `[start, end)` of the open document to `path` as a WAV in `format`.
+///
+/// Read-only, so — unlike `edit`/`trim` — it does not stop playback: exporting audio the user
+/// is listening to is harmless. The UI passes `[0, frames)` to export the whole file.
+#[tauri::command]
+fn export(
+    state: State<'_, AudioState>,
+    path: String,
+    start: usize,
+    end: usize,
+    format: ExportFormat,
+) -> Result<ExportDto, String> {
+    state
+        .export(std::path::Path::new(&path), start, end, format.into())
+        .map_err(|e| {
+            log::error!("export({path}, [{start}, {end}), {format:?}) failed: {e}");
+            // A partially-written file is worse than none: the encoder failed mid-stream, so
+            // clean it up rather than leaving a truncated WAV behind.
+            let _ = std::fs::remove_file(&path);
+            e.to_string()
+        })
+}
+
 /// Play `[start, end)` of the open document on the default output device, replacing any
 /// current playback. The range is clamped to the document; an empty one is an error.
 #[tauri::command]
@@ -320,6 +345,7 @@ pub fn run() {
             edit,
             trim,
             undo,
+            export,
             play,
             pause_playback,
             resume_playback,
