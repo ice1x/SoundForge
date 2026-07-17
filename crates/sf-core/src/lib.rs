@@ -21,6 +21,7 @@
 //! ```
 
 pub mod agg;
+pub mod capture;
 pub mod decode;
 pub mod edit;
 pub mod export;
@@ -28,6 +29,7 @@ pub mod stats;
 pub mod summary;
 
 pub use agg::Agg;
+pub use capture::CaptureWriter;
 pub use decode::{decode_file, DecodeError, PcmCache};
 pub use edit::{apply_gain, fade_in, fade_out, gain_for, normalize, peak, silence};
 pub use export::{export_wav, ExportError, WavFormat};

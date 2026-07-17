@@ -21,6 +21,7 @@
 pub mod audio;
 pub mod cache;
 pub mod player;
+pub mod recorder;
 
 use std::path::PathBuf;
 
@@ -31,6 +32,7 @@ use audio::{
     AudioInfo, AudioState, EditDto, EditOp, ExportDto, ExportFormat, StatsDto, WaveformDto,
 };
 use player::{PlaybackDto, Player};
+use recorder::{RecordDto, Recorder};
 
 /// IPC smoke-test command: verifies the web UI ↔ Rust bridge is wired up.
 /// Returns `"pong: <msg>"`.
@@ -63,11 +65,15 @@ fn open_file(
     app: tauri::AppHandle,
     state: State<'_, AudioState>,
     player: State<'_, Player>,
+    recorder: State<'_, Recorder>,
     path: String,
 ) -> Result<AudioInfo, String> {
     // Whatever is playing belongs to the outgoing document. Stopping first also releases the
     // device before the (slow) decode, rather than leaving a stream running through it.
     player.stop();
+    // Opening a file abandons any in-progress recording (the UI blocks this, but a stray drag
+    // & drop must not leave a capture thread writing to a cache nothing will ever adopt).
+    recorder.discard();
     let cache = next_cache_path(&app)?;
     let info = state
         .open(std::path::Path::new(&path), &cache)
@@ -93,13 +99,19 @@ fn audio_info(state: State<'_, AudioState>) -> Option<AudioInfo> {
 
 /// Close the open document and delete its PCM cache.
 #[tauri::command]
-fn close_file(state: State<'_, AudioState>, player: State<'_, Player>) {
+fn close_file(
+    state: State<'_, AudioState>,
+    player: State<'_, Player>,
+    recorder: State<'_, Recorder>,
+) {
     if state.info().is_some() {
         log::info!("closing document");
     }
     // Playback holds its own `Arc` on the PCM, so it would happily keep playing a file the
     // user has closed. Stop it first so closing means what it says.
     player.stop();
+    // Likewise abandon any recording in progress rather than leaving its thread running.
+    recorder.discard();
     state.close();
 }
 
@@ -252,6 +264,83 @@ fn playback_status(player: State<'_, Player>) -> PlaybackDto {
     player.status()
 }
 
+/// Start recording the default input device into a fresh PCM cache (task 15).
+///
+/// Stops playback and abandons any recording already in progress, then opens the input stream.
+/// The take is not yet a document — [`stop_recording`] seals it and adopts it. Returns the
+/// initial recording status so the UI can start polling `recording_status` for the elapsed
+/// take.
+#[tauri::command]
+fn start_recording(
+    app: tauri::AppHandle,
+    player: State<'_, Player>,
+    recorder: State<'_, Recorder>,
+) -> Result<RecordDto, String> {
+    // Recording a new document should not play the old one under it, and the input and output
+    // streams should not fight over the device.
+    player.stop();
+    let cache = next_cache_path(&app)?;
+    recorder
+        .start(cache)
+        .inspect(|dto| {
+            log::info!(
+                "recording started: {} ch, {} Hz",
+                dto.channels,
+                dto.sample_rate
+            );
+        })
+        .map_err(|e| {
+            log::error!("start_recording failed: {e}");
+            e.to_string()
+        })
+}
+
+/// Stop the recording, seal its PCM cache, and make it the open document.
+///
+/// Returns the new document geometry, or `null` when the take captured nothing (stop pressed
+/// immediately after start) — a non-event the UI reports gently rather than as a failure.
+#[tauri::command]
+fn stop_recording(
+    state: State<'_, AudioState>,
+    recorder: State<'_, Recorder>,
+) -> Result<Option<AudioInfo>, String> {
+    let summary = match recorder.stop() {
+        Ok(s) => s,
+        // Recording nothing is not an error, just an empty take.
+        Err(recorder::RecordError::Empty) => {
+            log::info!("recording stopped with no audio captured");
+            return Ok(None);
+        }
+        Err(e) => {
+            log::error!("stop_recording failed: {e}");
+            return Err(e.to_string());
+        }
+    };
+    let info = state
+        .adopt_planar(&summary.cache_path, summary.channels, summary.sample_rate)
+        .map_err(|e| {
+            // The cache was sealed but could not be adopted; do not leave it orphaned on disk.
+            let _ = std::fs::remove_file(&summary.cache_path);
+            log::error!("adopting the recording failed: {e}");
+            e.to_string()
+        })?;
+    log::info!(
+        "recorded {} frames ({:.3} s) into the open document",
+        info.frames,
+        info.duration_s
+    );
+    Ok(Some(info))
+}
+
+/// Current recording status: whether a take is in progress, and how much has been captured.
+///
+/// Polled by the UI while recording to show the elapsed time and any dropped frames, the same
+/// way `playback_status` drives the playhead.
+#[tauri::command]
+fn recording_status(recorder: State<'_, Recorder>) -> RecordDto {
+    recorder.status()
+}
+
 /// Receive a log line from the web UI and record it through the backend logger, so that
 /// UI diagnostics land in the same file as native logs. `level` is one of
 /// `error|warn|info|debug|trace` (anything else is treated as `info`).
@@ -295,6 +384,7 @@ pub fn run() {
         )
         .manage(AudioState::default())
         .manage(Player::default())
+        .manage(Recorder::default())
         .setup(|app| {
             log::info!(
                 "SoundForge {} starting (debug_assertions={})",
@@ -350,7 +440,10 @@ pub fn run() {
             pause_playback,
             resume_playback,
             stop_playback,
-            playback_status
+            playback_status,
+            start_recording,
+            stop_recording,
+            recording_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

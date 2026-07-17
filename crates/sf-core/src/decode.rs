@@ -220,7 +220,9 @@ impl PcmCache {
 }
 
 /// Sibling temp path for channel `ch`'s spill file next to the final `cache` path.
-fn spill_path(cache: &Path, ch: usize) -> PathBuf {
+///
+/// Shared with [`crate::capture`], which spills a live recording the same way a decode does.
+pub(crate) fn spill_path(cache: &Path, ch: usize) -> PathBuf {
     let mut s = cache.as_os_str().to_owned();
     s.push(format!(".ch{ch}.tmp"));
     PathBuf::from(s)
@@ -394,7 +396,9 @@ fn decode_loop(
 
 /// Concatenate the per-channel spill files into the final planar `cache` file (channel 0,
 /// then channel 1, …). For a single channel this is just a rename, avoiding a full copy.
-fn concat_spills(
+///
+/// Shared with [`crate::capture`], whose recording writer produces the same per-channel spills.
+pub(crate) fn concat_spills(
     cache: &Path,
     spill_paths: &[PathBuf],
     channels: usize,
