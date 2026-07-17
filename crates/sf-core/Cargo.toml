@@ -18,3 +18,12 @@ bytemuck = "1"
 # WAV encoding for export (task 17). Also used across the crate's tests to synthesize
 # deterministic WAV fixtures for the decode round-trip.
 hound = "3"
+
+# Seamless statistics benchmark (task 18): a full 2-hour (~1.2 GB) buffer drag.
+# `harness = false` — it is a plain `fn main()` self-checking benchmark (own thresholds,
+# own allocation counter), not the libtest `#[bench]` harness. Run it with `cargo bench`
+# (or `scripts/build.sh bench`); it is deliberately kept out of the `cargo test` CI gate
+# because allocating 1.2 GB is far too heavy for shared runners. Dependency-free.
+[[bench]]
+name = "seamless"
+harness = false

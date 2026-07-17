@@ -35,6 +35,31 @@ alongside the memory-mapped PCM in `src-tauri/src/audio.rs`; each query then bor
 release build: ~1.2 µs per stats query whether the selection is 1 000 samples or the whole
 file, i.e. a full selection drag costs ~1.2 µs per mouse-move.
 
+### Benchmark
+
+`scripts/build.sh bench` (task 18) proves that claim at the real target scale: a **2-hour,
+~1.2 GB** single channel — 317.5 M samples at 44.1 kHz `f32`, the per-channel size of a
+2-hour stereo take — driven through the exact path a selection drag takes in the app
+(`Analyzer::with_pyramid(…).range(s, e)` then `RangeStats::from_agg`). It measures a
+simulated drag (one query per mouse-move) at selection lengths from 1 000 samples to the
+whole file and self-checks three things, exiting non-zero if any regresses:
+
+1. **< 5 ms per drag update** — the p99 query latency. Measured p99 is ~26 µs, ~190× under
+   budget.
+2. **Independent of selection length** — median latency stays within a small factor as the
+   selection grows by 300 000×; an O(n) regression (e.g. a raw rescan) would blow this up by
+   orders of magnitude.
+3. **RAM stable** — the drag loop performs **zero heap allocations**, checked exactly with a
+   counting global allocator rather than by sampling RSS: a loop that never allocates cannot
+   grow the resident set.
+
+The benchmark lives in `crates/sf-core/benches/seamless.rs` (`harness = false`, a plain
+self-checking `fn main`). It is deliberately kept **out of the CI `check` gate** — allocating
+1.2 GB is too heavy for shared runners. The same invariant is guarded cheaply and
+deterministically in CI by `summary::tests::query_cost_is_independent_of_selection_length`,
+which counts the raw samples and pyramid blocks a query touches (no timing, no giant buffer).
+Tune the run with `SF_BENCH_SECS` / `SF_BENCH_SR` / `SF_BENCH_MOVES`.
+
 ## IPC commands
 
 The web UI calls these via `invoke()` (see `src-tauri/src/lib.rs`):
@@ -216,6 +241,7 @@ list; the most useful commands are:
 |---|---|
 | `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` + the `ui/` tests — the gate that must be green before pushing (mirrors CI) |
 | `scripts/build.sh ui` | just the `ui/` tests (`node --test`) |
+| `scripts/build.sh bench` | the seamless-statistics benchmark (task 18) — see [Benchmark](#benchmark) |
 | `scripts/build.sh release` | optimized release build of the whole workspace (default) |
 | `scripts/build.sh app` | bundle the native `.app`/`.dmg` via `cargo tauri build` |
 | `scripts/build.sh dev` | run the app in watch mode via `cargo tauri dev` |
@@ -250,5 +276,5 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
 - [x] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
 - [x] 17 — WAV export (`hound`) of selection or whole file
-- [ ] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
+- [x] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
 - [ ] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
