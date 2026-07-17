@@ -15,7 +15,6 @@ path = "src/lib.rs"
 symphonia = { version = "0.5", features = ["all"] }
 memmap2 = "0.9"
 bytemuck = "1"
-
-[dev-dependencies]
-# Synthesize deterministic WAV fixtures for the decode round-trip tests.
+# WAV encoding for export (task 17). Also used across the crate's tests to synthesize
+# deterministic WAV fixtures for the decode round-trip.
 hound = "3"

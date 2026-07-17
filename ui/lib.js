@@ -114,6 +114,17 @@ export function fmtMeta(name, info) {
   return `${name} · ${info.sampleRate} Hz · ${info.channels} ch · ${info.durationS.toFixed(3)} s`;
 }
 
+/// The default filename to suggest in the export Save dialog.
+///
+/// Derived from the open file's name so a "song.mp3" exports to "song.wav" (or
+/// "song-selection.wav" when only a selection is exported). The source extension is dropped —
+/// export always writes WAV — and a `.wav` source gains a suffix so it can never propose
+/// overwriting the very file being edited. Falls back to "audio" when there is no name.
+export function exportFileName(name, selected) {
+  const base = (name || 'audio').replace(/\.[^./\\]+$/, '').trim() || 'audio';
+  return `${base}${selected ? '-selection' : ''}.wav`;
+}
+
 /// Build the Statistics panel's row model from a `StatsDto`.
 ///
 /// This is where the backend's linear values become dB. Rows mirror the `miniforge.html`

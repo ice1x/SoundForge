@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use sf_core::{decode_file, stats::RangeStats, Analyzer, DecodeError, PcmCache, Pyramid};
+use sf_core::{
+    decode_file, export_wav, stats::RangeStats, Analyzer, DecodeError, ExportError, PcmCache,
+    Pyramid, WavFormat,
+};
 
 /// Upper bound on waveform bins per request. A bin maps to one horizontal pixel, so this is
 /// far above any real window width; it exists to stop a malformed request from asking the
@@ -44,6 +47,8 @@ pub enum AudioError {
     NothingToUndo,
     /// Writing the trimmed cache failed.
     Io(String),
+    /// Writing the exported WAV failed.
+    Export(String),
 }
 
 impl std::fmt::Display for AudioError {
@@ -61,6 +66,7 @@ impl std::fmt::Display for AudioError {
             AudioError::EmptyRange => write!(f, "select a range first"),
             AudioError::NothingToUndo => write!(f, "nothing to undo"),
             AudioError::Io(e) => write!(f, "{e}"),
+            AudioError::Export(e) => write!(f, "{e}"),
         }
     }
 }
@@ -70,6 +76,12 @@ impl std::error::Error for AudioError {}
 impl From<DecodeError> for AudioError {
     fn from(e: DecodeError) -> Self {
         AudioError::Decode(e)
+    }
+}
+
+impl From<ExportError> for AudioError {
+    fn from(e: ExportError) -> Self {
+        AudioError::Export(e.to_string())
     }
 }
 
@@ -192,6 +204,42 @@ impl EditOp {
             EditOp::Silence => "silence",
         }
     }
+}
+
+/// The sample format the UI asks a WAV export to be written in.
+///
+/// A shell-side mirror of [`sf_core::WavFormat`] carrying the `serde` derive that lets it
+/// arrive from JS as a camelCase string, the same pattern as [`EditOp`]. Keeping the derive
+/// here rather than on the core type is what lets `sf_core` stay free of a `serde` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportFormat {
+    /// 16-bit signed PCM — the shareable interchange default.
+    Pcm16,
+    /// 32-bit float — a lossless copy of the internal samples.
+    Float32,
+}
+
+impl From<ExportFormat> for WavFormat {
+    fn from(f: ExportFormat) -> Self {
+        match f {
+            ExportFormat::Pcm16 => WavFormat::Pcm16,
+            ExportFormat::Float32 => WavFormat::Float32,
+        }
+    }
+}
+
+/// What was written, returned to the UI so it can confirm the export.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportDto {
+    /// Destination path as written.
+    pub path: String,
+    pub channels: usize,
+    pub sample_rate: u32,
+    /// Frames actually written (the length of the exported range).
+    pub frames: usize,
+    pub duration_s: f64,
 }
 
 /// One reversible step.
@@ -638,6 +686,54 @@ impl AudioState {
     /// Whether there is anything to undo.
     pub fn can_undo(&self) -> bool {
         self.lock().as_ref().is_some_and(|d| !d.undo.is_empty())
+    }
+
+    /// Write `[start, end)` of every channel to `path` as a WAV in `format` (task 17).
+    ///
+    /// The range is clamped to the document; an empty one is [`AudioError::EmptyRange`], as
+    /// with the edits — exporting nothing is a mistake worth reporting. "Export the whole
+    /// file" is just `[0, frames)`, which the UI passes when there is no selection.
+    ///
+    /// Unlike an edit or a trim this needs no [`AudioError::Busy`] guard: it only *reads* the
+    /// samples, so it is safe to run while playback is reading them from the audio thread —
+    /// both are shared, read-only views of the same memory map.
+    pub fn export(
+        &self,
+        path: &Path,
+        start: usize,
+        end: usize,
+        format: WavFormat,
+    ) -> Result<ExportDto, AudioError> {
+        let guard = self.lock();
+        let doc = guard.as_ref().ok_or(AudioError::NoDocument)?;
+        let frames = doc.info.frames;
+        let channels = doc.info.channels;
+        let sample_rate = doc.info.sample_rate;
+        let start = start.min(frames);
+        let end = end.min(frames);
+        if start >= end {
+            return Err(AudioError::EmptyRange);
+        }
+
+        // Sub-slice each planar channel to the selection; the export interleaves them. Reading
+        // straight from the map keeps this memory-bounded even for a multi-hour range.
+        let slices: Vec<&[f32]> = (0..channels)
+            .map(|ch| &doc.cache.channel(ch)[start..end])
+            .collect();
+        export_wav(path, &slices, sample_rate, format)?;
+
+        let exported = end - start;
+        log::info!(
+            "exported frames [{start}, {end}) ({exported}) to {}",
+            path.display()
+        );
+        Ok(ExportDto {
+            path: path.display().to_string(),
+            channels,
+            sample_rate,
+            frames: exported,
+            duration_s: exported as f64 / sample_rate as f64,
+        })
     }
 
     /// Min/max envelope of `[start, end)` on channel `ch`, bucketed into `bins` pixels.
@@ -1399,6 +1495,182 @@ mod tests {
         ));
         drop(held);
         assert!(!new_cache.exists(), "a rejected trim must not leave a file");
+    }
+
+    // ---------- export ----------
+
+    /// Read a WAV back to interleaved `f32`, whatever its on-disk format (mirrors the helper
+    /// in `sf_core::export`'s tests).
+    fn read_wav(path: &Path) -> (hound::WavSpec, Vec<f32>) {
+        let mut r = hound::WavReader::open(path).unwrap();
+        let spec = r.spec();
+        let samples = match spec.sample_format {
+            hound::SampleFormat::Float => r.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => r
+                .samples::<i32>()
+                .map(|s| s.unwrap() as f32 / 32767.0)
+                .collect(),
+        };
+        (spec, samples)
+    }
+
+    #[test]
+    fn export_whole_file_writes_every_frame_losslessly() {
+        let (state, _c) = open_sine();
+        let out = tmp("whole.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+
+        let dto = state.export(&out, 0, 48_000, WavFormat::Float32).unwrap();
+        assert_eq!(dto.frames, 48_000);
+        assert_eq!(dto.channels, 1);
+        assert_eq!(dto.sample_rate, 48_000);
+        assert!((dto.duration_s - 1.0).abs() < 1e-9);
+
+        let (spec, got) = read_wav(&out);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 48_000);
+        // Float export is the exact internal samples.
+        assert_eq!(got, sine_1k(48_000));
+    }
+
+    #[test]
+    fn export_writes_only_the_selection() {
+        let (state, _c) = open_sine();
+        let out = tmp("sel.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        let samples = sine_1k(48_000);
+
+        let dto = state.export(&out, 1000, 5000, WavFormat::Float32).unwrap();
+        assert_eq!(dto.frames, 4000);
+
+        let (_spec, got) = read_wav(&out);
+        assert_eq!(got.len(), 4000);
+        assert_eq!(got, samples[1000..5000].to_vec());
+    }
+
+    #[test]
+    fn export_interleaves_multichannel_documents() {
+        let src = tmp("exp-stereo.wav");
+        let cache = tmp("exp-stereo.pcm");
+        let _c = Cleanup(vec![src.clone(), cache.clone()]);
+        let left = vec![0.25f32; 512];
+        let right = vec![-0.5f32; 512];
+        write_wav(&src, &[left, right], 32_000);
+        let state = AudioState::default();
+        state.open(&src, &cache).unwrap();
+
+        let out = tmp("exp-out.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        state.export(&out, 0, 512, WavFormat::Float32).unwrap();
+
+        let (spec, got) = read_wav(&out);
+        assert_eq!(spec.channels, 2);
+        // Frame-major on disk: the first frame is (L, R).
+        assert_eq!(&got[0..2], &[0.25, -0.5]);
+        assert_eq!(got.len(), 1024);
+    }
+
+    #[test]
+    fn export_reflects_an_edit_before_it() {
+        // Export reads the live document, so a normalize must be audible in the file.
+        let (state, _c, _p) = open_stereo();
+        state.edit(EditOp::Normalize, 0, FIXTURE_FRAMES).unwrap();
+        let out = tmp("edited.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        state
+            .export(&out, 0, FIXTURE_FRAMES, WavFormat::Float32)
+            .unwrap();
+        let (_spec, got) = read_wav(&out);
+        // The loud channel now peaks at full scale; the interleaved max must reach ~1.0.
+        let peak = got.iter().cloned().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 1.0).abs() < 1e-3, "exported peak {peak}");
+    }
+
+    #[test]
+    fn export_pcm16_produces_a_16_bit_int_wav() {
+        let (state, _c) = open_sine();
+        let out = tmp("pcm16.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        state.export(&out, 0, 4000, WavFormat::Pcm16).unwrap();
+        let (spec, got) = read_wav(&out);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        // Quantised but close to the source sine.
+        let src = sine_1k(48_000);
+        for i in 0..4000 {
+            assert!((got[i] - src[i]).abs() < 2.0 / 32767.0, "sample {i}");
+        }
+    }
+
+    #[test]
+    fn export_rejects_an_empty_selection_and_a_missing_document() {
+        let (state, _c) = open_sine();
+        let out = tmp("empty.wav");
+        for &(s, e) in &[(500usize, 500usize), (900, 400), (99_000, 100_000)] {
+            assert!(
+                matches!(
+                    state.export(&out, s, e, WavFormat::Float32),
+                    Err(AudioError::EmptyRange)
+                ),
+                "[{s},{e})"
+            );
+        }
+        assert!(!out.exists(), "a rejected export must not leave a file");
+        assert!(matches!(
+            AudioState::default().export(&out, 0, 1, WavFormat::Float32),
+            Err(AudioError::NoDocument)
+        ));
+    }
+
+    #[test]
+    fn export_clamps_an_over_long_range_to_the_document() {
+        let (state, _c) = open_sine();
+        let out = tmp("clamped.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        let dto = state.export(&out, 0, 999_999, WavFormat::Float32).unwrap();
+        assert_eq!(dto.frames, 48_000, "range past the end must clamp");
+    }
+
+    #[test]
+    fn export_can_run_while_playback_holds_the_samples() {
+        // Export is read-only, so unlike an edit it must not be rejected as busy.
+        let (state, _c) = open_sine();
+        let held = state.pcm().unwrap();
+        let out = tmp("busy.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        assert!(
+            state.export(&out, 0, 1000, WavFormat::Float32).is_ok(),
+            "a read-only export must not need exclusive access"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn export_format_deserializes_from_camel_case() {
+        assert_eq!(
+            serde_json::from_str::<ExportFormat>("\"pcm16\"").unwrap(),
+            ExportFormat::Pcm16
+        );
+        assert_eq!(
+            serde_json::from_str::<ExportFormat>("\"float32\"").unwrap(),
+            ExportFormat::Float32
+        );
+        assert_eq!(WavFormat::from(ExportFormat::Pcm16), WavFormat::Pcm16);
+        assert_eq!(WavFormat::from(ExportFormat::Float32), WavFormat::Float32);
+    }
+
+    #[test]
+    fn export_dto_serializes_camel_case_for_the_ui() {
+        let (state, _c) = open_sine();
+        let out = tmp("dto.wav");
+        let _c2 = Cleanup(vec![out.clone()]);
+        let dto = state.export(&out, 0, 100, WavFormat::Pcm16).unwrap();
+        let js = serde_json::to_value(&dto).unwrap();
+        assert_eq!(js["frames"], 100);
+        assert_eq!(js["sampleRate"], 48_000);
+        assert_eq!(js["channels"], 1);
+        assert!(js.get("durationS").is_some());
+        assert_eq!(js["path"], out.display().to_string());
     }
 
     #[test]

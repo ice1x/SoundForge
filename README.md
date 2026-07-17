@@ -146,16 +146,24 @@ timer, because only the audio callback knows what has actually been heard.
 Opening a file needs a real filesystem path, which the webview's `<input type="file">` cannot
 give, so the shell registers `tauri-plugin-dialog`. The project has no JS bundler, so the UI
 calls the plugin by its raw command name (`invoke('plugin:dialog|open', …)`) rather than
-importing the plugin's npm package. The capability grants `dialog:allow-open` and also
-`dialog:allow-message` — the plugin unconditionally rewires `window.alert` to
-`plugin:dialog|message`, so leaving that ungranted would turn any stray `alert()` into an
-opaque permission error.
+importing the plugin's npm package. The capability grants `dialog:allow-open`,
+`dialog:allow-save` (the export destination picker) and also `dialog:allow-message` — the
+plugin unconditionally rewires `window.alert` to `plugin:dialog|message`, so leaving that
+ungranted would turn any stray `alert()` into an opaque permission error.
 
 The transport plays exactly what the Statistics panel describes: the selection, or the whole
 file when there is none. Play/pause is the `playBtn` toggle or the space bar.
 
-Recording, edits and export are still backend features; their controls are present but
-disabled, each labelled with what will land it.
+Edits and export act on that same range. **Save WAV** (`⌘S`) exports the selection — or the
+whole file when there is none — through the native save dialog; the backend reads straight
+from the memory-mapped PCM and writes it interleaved via `hound`, so a multi-hour export
+never materialises in RAM. It writes 16-bit PCM (the universally-playable interchange format);
+the backend `export` command also supports lossless 32-bit float. The `sf_core::export` module
+is pure and range-agnostic — it takes one already-sliced `&[f32]` per channel — so "export the
+selection" is the same slicing the edits do.
+
+Recording is still a backend feature; its control is present but disabled, labelled with what
+will land it.
 
 ## Layout
 
@@ -222,6 +230,6 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
 - [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
 - [x] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
-- [ ] 17 — WAV export (`hound`) of selection or whole file
+- [x] 17 — WAV export (`hound`) of selection or whole file
 - [ ] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
 - [ ] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
