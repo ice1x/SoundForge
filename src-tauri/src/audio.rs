@@ -410,14 +410,48 @@ impl AudioState {
     /// when it is dropped here, which would delete this one if the paths collided.
     pub fn open(&self, src: &Path, cache_path: &Path) -> Result<AudioInfo, AudioError> {
         let cache = decode_file(src, cache_path)?;
-        // The only O(n) work in the whole pipeline, done once per file.
+        Ok(self.install(cache, cache_path, src.display().to_string()))
+    }
+
+    /// Adopt an already-written planar PCM cache as the open document (task 15).
+    ///
+    /// A recording produces the same on-disk layout a decode does (see
+    /// [`sf_core::CaptureWriter`]), so making a finished take the current document is just
+    /// mapping its cache and building the pyramids — no decode, no O(n) re-scan of the source.
+    /// The `channels`/`sample_rate` are what the recording captured at; they are not stored in
+    /// the headerless cache and so must be supplied, exactly as [`PcmCache::open_planar`] needs.
+    ///
+    /// The document takes ownership of `cache_path` and deletes it on drop, so the recording's
+    /// cache becomes the document's backing store — it must be a unique path in the app cache
+    /// directory (which [`crate::cache::next_path`] guarantees), not a file shared with anything
+    /// else.
+    pub fn adopt_planar(
+        &self,
+        cache_path: &Path,
+        channels: usize,
+        sample_rate: u32,
+    ) -> Result<AudioInfo, AudioError> {
+        let cache = PcmCache::open_planar(cache_path, channels, sample_rate)?;
+        Ok(self.install(cache, cache_path, "recording".to_string()))
+    }
+
+    /// Build the pyramids for `cache`, wrap it in a [`Document`], and make it the open one
+    /// (replacing and cleaning up any previous document).
+    ///
+    /// The single place a document is installed, shared by [`open`](AudioState::open) (decoded
+    /// from a file) and [`adopt_planar`](AudioState::adopt_planar) (sealed from a recording).
+    /// `cache_path` must be unique per call: the previous document's cache file is removed when
+    /// it is dropped here, which would delete this one if the paths collided.
+    fn install(&self, cache: PcmCache, cache_path: &Path, path: String) -> AudioInfo {
+        // The only O(n) work in the whole pipeline, done once per document.
         let pyramids: Vec<Pyramid> = (0..cache.channels())
             .map(|ch| Pyramid::build(cache.channel(ch)))
             .collect();
 
-        // decode_file rejects a zero sample rate (DecodeError::Empty), so this cannot divide by zero.
+        // Both callers reject a zero sample rate upstream (decode_file / open_planar), so this
+        // cannot divide by zero.
         let info = AudioInfo {
-            path: src.display().to_string(),
+            path,
             channels: cache.channels(),
             sample_rate: cache.sample_rate(),
             frames: cache.frames(),
@@ -431,7 +465,7 @@ impl AudioState {
             undo: Vec::new(),
         };
         *self.lock() = Some(doc);
-        Ok(info)
+        info
     }
 
     /// Geometry of the open document, or `None` if nothing is open.
@@ -809,6 +843,16 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    /// Write a raw planar `f32` cache (channel-major), as a recording or a decode produces —
+    /// used to exercise [`AudioState::adopt_planar`] without a real input device.
+    fn write_planar(path: &Path, channels: &[Vec<f32>]) {
+        let mut bytes = Vec::new();
+        for ch in channels {
+            bytes.extend_from_slice(bytemuck::cast_slice(ch));
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
     /// A 1 kHz sine at 48 kHz lasting exactly 1 s (whole cycles), as in the sf-core tests.
     fn sine_1k(sr: u32) -> Vec<f32> {
         (0..sr)
@@ -1046,6 +1090,72 @@ mod tests {
         // The replaced document dropped, taking its cache file with it.
         assert!(!cache_a.exists(), "previous PCM cache should be cleaned up");
         assert!(cache_b.exists());
+    }
+
+    #[test]
+    fn adopt_planar_makes_a_recording_the_open_document() {
+        // A finished recording is a planar cache with no source file; adopting it must build
+        // the pyramids so statistics work exactly as for an opened file.
+        let cache = tmp("rec.cache");
+        let _c = Cleanup(vec![cache.clone()]);
+        // Channel 0 a constant +0.5, channel 1 a constant -0.25: impossible to confuse.
+        write_planar(&cache, &[vec![0.5f32; 1000], vec![-0.25f32; 1000]]);
+
+        let state = AudioState::default();
+        let info = state.adopt_planar(&cache, 2, 16_000).unwrap();
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.sample_rate, 16_000);
+        assert_eq!(info.frames, 1000);
+        assert!((info.duration_s - 1000.0 / 16_000.0).abs() < 1e-9);
+        assert_eq!(state.info().unwrap(), info);
+
+        let l = state.stats(0, 0, 1000).unwrap();
+        assert!((l.dc - 0.5).abs() < 1e-6, "dc {}", l.dc);
+        assert!((l.rms - 0.5).abs() < 1e-6, "rms {}", l.rms);
+        let r = state.stats(1, 0, 1000).unwrap();
+        assert!((r.dc + 0.25).abs() < 1e-6, "dc {}", r.dc);
+        // The waveform reads the pyramid too, proving it was built for the adopted cache.
+        let wf = state.waveform(0, 0, 1000, 8).unwrap();
+        assert!(wf.max.iter().all(|&v| (v - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn adopting_a_recording_replaces_and_cleans_up_the_previous_document() {
+        // Recording while a file is open swaps the document: the old file's cache is deleted,
+        // the recording's cache becomes the new backing store.
+        let src = tmp("prev.wav");
+        let prev_cache = tmp("prev.pcm");
+        let rec_cache = tmp("adopt.cache");
+        let _c = Cleanup(vec![src.clone(), prev_cache.clone(), rec_cache.clone()]);
+        write_wav(&src, std::slice::from_ref(&vec![0.25f32; 1024]), 8000);
+        write_planar(&rec_cache, std::slice::from_ref(&vec![0.75f32; 2048]));
+
+        let state = AudioState::default();
+        state.open(&src, &prev_cache).unwrap();
+        assert!(prev_cache.exists());
+
+        let info = state.adopt_planar(&rec_cache, 1, 48_000).unwrap();
+        assert_eq!(info.frames, 2048);
+        assert_eq!(info.sample_rate, 48_000);
+        assert!(
+            !prev_cache.exists(),
+            "the previous document's cache should be cleaned up"
+        );
+        assert!(
+            rec_cache.exists(),
+            "the recording's cache is the new backing store"
+        );
+    }
+
+    #[test]
+    fn adopting_a_malformed_cache_is_an_error_and_leaves_no_document() {
+        let cache = tmp("bad.cache");
+        let _c = Cleanup(vec![cache.clone()]);
+        // 3 f32 samples cannot be split into 2 channels.
+        write_planar(&cache, &[vec![1.0f32, 2.0, 3.0]]);
+        let state = AudioState::default();
+        assert!(state.adopt_planar(&cache, 2, 8000).is_err());
+        assert!(state.info().is_none());
     }
 
     #[test]

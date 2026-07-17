@@ -27,6 +27,8 @@ import {
   panBy,
   playLabel,
   playheadVisible,
+  recLabel,
+  recMeta,
   sampleToX,
   statsRows,
   viewToSample,
@@ -389,4 +391,23 @@ test('a play request uses the selection, or the whole file when there is none', 
   // The transport plays exactly what the Statistics panel describes.
   assert.deepEqual(effectiveRange({ start: 10, end: 90 }, 500), { start: 10, end: 90 });
   assert.deepEqual(effectiveRange({ start: 42, end: 42 }, 500), { start: 0, end: 500 });
+});
+
+// ---------- recording ----------
+
+test('recLabel turns the Record button into a Stop control while recording', () => {
+  assert.equal(recLabel(false), '● Record');
+  assert.equal(recLabel(true), '■ Stop');
+});
+
+test('recMeta shows the elapsed take', () => {
+  assert.equal(recMeta({ durationS: 3.25, overruns: 0 }), '● recording — 3.250 s');
+  assert.equal(recMeta({ durationS: 65, overruns: 0 }), '● recording — 1:05.000');
+});
+
+test('recMeta flags dropped frames only when some were dropped', () => {
+  // A clean take must not mention drops; a starved one must, so a glitchy recording is
+  // visible rather than silent.
+  assert.doesNotMatch(recMeta({ durationS: 1, overruns: 0 }), /dropped/);
+  assert.equal(recMeta({ durationS: 1, overruns: 4200 }), `● recording — 1.000 s · 4${NNBSP}200 frames dropped`);
 });

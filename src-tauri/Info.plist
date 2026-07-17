@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Recording (task 15) opens the microphone via cpal/CoreAudio. macOS refuses input-device
+    access — and, for a bundled .app, terminates the process on the first attempt — unless the
+    binary declares why it needs the microphone. Tauri v2 merges this file into the generated
+    Info.plist when bundling the macOS app, so this string is what the system permission prompt
+    shows the user the first time they press Record.
+  -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>SoundForge records audio from the input device you choose.</string>
+</dict>
+</plist>

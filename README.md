@@ -54,6 +54,10 @@ The web UI calls these via `invoke()` (see `src-tauri/src/lib.rs`):
 | `edit` | `op`, `start`, `end` | `EditDto` — `normalize`/`fadeIn`/`fadeOut`/`silence`, in place across every channel |
 | `trim` | `start`, `end` | `EditDto` — discard everything outside the range (changes `frames`) |
 | `undo` | — | `EditDto` — reverse the most recent edit |
+| `export` | `path`, `start`, `end`, `format` | `ExportDto` — write the range to a WAV (`pcm16`/`float32`) |
+| `start_recording` | — | `RecordDto` — open the input device and begin capturing into a fresh cache |
+| `stop_recording` | — | `AudioInfo` or `null` — seal the take as the open document (`null` = nothing captured) |
+| `recording_status` | — | `RecordDto` — recording state + elapsed frames + dropped frames (polled while recording) |
 
 Ranges are half-open and clamped to the document; an empty selection yields zeroed stats.
 Values are **linear** — dB formatting stays in the UI (as in the `miniforge.html` prototype),
@@ -162,8 +166,23 @@ the backend `export` command also supports lossless 32-bit float. The `sf_core::
 is pure and range-agnostic — it takes one already-sliced `&[f32]` per channel — so "export the
 selection" is the same slicing the edits do.
 
-Recording is still a backend feature; its control is present but disabled, labelled with what
-will land it.
+**Record** (`recBtn`) captures the default input device natively, through `cpal`'s CoreAudio
+backend — not the browser `MediaRecorder`, which does not exist in the macOS WKWebView the
+shell runs in. It is the mirror image of playback: the realtime input callback only pushes the
+device's frames into a lock-free ring, and a writer thread spills them per channel into a
+`sf_core::CaptureWriter`, which seals a planar PCM cache on stop — the *same* on-disk layout a
+decode produces. So a finished take is adopted as the open document with no decode step
+(`AudioState::adopt_planar`), and behaves identically to an opened file: seamless statistics,
+playback, edits, export. Nothing larger than one callback batch is ever held in RAM, so an
+arbitrarily long take is bounded the same way a multi-hour file is. Recording replaces whatever
+document is open only once it produces audio; a take that captured nothing leaves the current
+document untouched.
+
+macOS gates microphone access behind an `NSMicrophoneUsageDescription`, so the shell ships an
+`src-tauri/Info.plist` that Tauri merges into the bundled `.app`; without it a bundled build
+would be terminated on the first capture attempt. Recording is entirely backend-driven through
+the app's own `start_recording`/`stop_recording` IPC commands, so it needs no extra capability
+grant (unlike the dialog plugin above).
 
 ## Layout
 
@@ -228,7 +247,7 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 12 — Reap orphaned PCM caches (`cache`) — startup sweep of caches left by an instance that died without running `Drop`
 - [x] 13 — Port `miniforge.html` UI to `ui/index.html`; draw waveform + Statistics from IPC
 - [x] 14 — Playback (`cpal` output + `rtrb` ring buffer), play selection
-- [ ] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
+- [x] 15 — Recording (`cpal` input, native) into the PCM cache — replaces the browser MediaRecorder path unavailable in WKWebView; needs `NSMicrophoneUsageDescription`
 - [x] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
 - [x] 17 — WAV export (`hound`) of selection or whole file
 - [ ] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable

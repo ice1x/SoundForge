@@ -169,6 +169,18 @@ export function playheadVisible(state) {
   return state === 'playing' || state === 'paused' || state === 'finished';
 }
 
+/// The Record button's label: it becomes a Stop control while a take is in progress.
+export function recLabel(recording) {
+  return recording ? '■ Stop' : '● Record';
+}
+
+/// The header line shown while recording: the elapsed take, plus a note when frames have been
+/// dropped (the writer thread fell behind). `durationS`/`overruns` come from `recording_status`.
+export function recMeta(status) {
+  const dropped = status.overruns > 0 ? ` · ${fmtCount(status.overruns)} frames dropped` : '';
+  return `● recording — ${fmtTime(status.durationS)}${dropped}`;
+}
+
 /// Run `fn` with at most one call in flight, always finishing with the newest arguments.
 ///
 /// A selection drag fires mouse-moves far faster than an IPC round-trip completes. Awaiting

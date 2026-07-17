@@ -22,6 +22,8 @@ import {
   panBy,
   playLabel,
   playheadVisible,
+  recLabel,
+  recMeta,
   sampleToX,
   statsRows,
   viewToSample,
@@ -115,6 +117,9 @@ let canUndo = false;
 /// Basename of the open file, kept for the meta line: a trim changes the geometry, so the
 /// line is rebuilt from `info` and needs the name again.
 let currentName = '';
+/// Whether a recording is in progress. While true the rest of the controls are inert — the
+/// backend owns the input device and the take is not yet a document.
+let recording = false;
 
 // ---------- error banner ----------
 
@@ -470,20 +475,27 @@ async function openPath(path) {
     showError(`Could not open the file: ${e.message || e}`);
     return;
   }
-  info = opened;
-
   const name = path.split('/').pop() || path;
+  sflog('info', `opened ${path}: ${opened.channels} ch, ${opened.sampleRate} Hz, ${opened.frames} frames`);
+  showDocument(opened, name);
+}
+
+/// Adopt a fresh document (`AudioInfo`) as the open one and reset every view to it.
+///
+/// Shared by opening a file and finishing a recording — both replace the document wholesale on
+/// the backend, so both re-fit the view, clear the selection, rebuild the channel selector and
+/// re-enable the controls the same way. The backend has already stopped any playback of the
+/// outgoing document, so the transport is reset here to match.
+function showDocument(newInfo, name) {
+  info = newInfo;
   currentName = name;
   canUndo = false;
   $('fileMeta').textContent = fmtMeta(name, info);
-  sflog('info', `opened ${path}: ${info.channels} ch, ${info.sampleRate} Hz, ${info.frames} frames`);
 
   view = fitView(info.frames);
   sel = { start: 0, end: 0 };
   statsCh = 0;
   envelopes = [];
-  // `open_file` stops playback of the outgoing document on the backend; mirror that here so
-  // the button and the playhead do not describe a file that is no longer open.
   playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
   $('playBtn').textContent = playLabel(playback.state);
 
@@ -593,6 +605,86 @@ async function saveFile() {
   }
 }
 
+// ---------- recording ----------
+
+/// Toggle every other control while a recording owns the input device. On stop, restore them
+/// from the current document state — a recording may or may not have produced a new one.
+function setRecordingUI(on) {
+  $('recBtn').textContent = recLabel(on);
+  $('recBtn').classList.toggle('primary', on);
+  const others = [
+    'openBtn', 'closeBtn', 'saveBtn', 'playBtn', 'selAllBtn', 'clrSelBtn', 'fitBtn',
+    'zoomSelBtn', 'normBtn', 'fadeInBtn', 'fadeOutBtn', 'silenceBtn', 'trimBtn', 'undoBtn',
+  ];
+  if (on) {
+    for (const id of others) $(id).disabled = true;
+    $('chSel').disabled = true;
+  } else {
+    // Re-enable exactly as opening/closing a document would: Open is always available, the
+    // document controls follow whether a document is present, and Undo follows the stack.
+    $('openBtn').disabled = false;
+    setDocumentControlsEnabled(!!info);
+    updateEditControls();
+    $('chSel').disabled = !info || info.channels < 2;
+  }
+}
+
+/// Follow the elapsed take until recording stops. Polled like the playhead — cheap on the
+/// backend (a couple of atomic loads) and driven by a timer since it is just a counter.
+let recPolling = false;
+async function pollRecording() {
+  if (recPolling) return;
+  recPolling = true;
+  try {
+    while (recording) {
+      const status = await invoke('recording_status');
+      // `recording` may have been cleared by `toggleRecord` while this was in flight.
+      if (recording) $('fileMeta').textContent = recMeta(status);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } catch (e) {
+    sflog('warn', 'recording_status failed:', e);
+  } finally {
+    recPolling = false;
+  }
+}
+
+/// The Record button: start capturing the input device, or stop and adopt the take as the new
+/// document. Capturing replaces whatever file is open, so a stop with audio behaves just like
+/// opening a file; a stop with nothing captured leaves the current document as it was.
+async function toggleRecord() {
+  clearError();
+  if (!recording) {
+    try {
+      await invoke('start_recording');
+      recording = true;
+      setRecordingUI(true);
+      pollRecording();
+    } catch (e) {
+      showError(`Could not start recording: ${e.message || e}`);
+    }
+    return;
+  }
+
+  // Stop: clear the flag first so the poll loop and its meta updates wind down.
+  recording = false;
+  setRecordingUI(false);
+  try {
+    const recorded = await invoke('stop_recording');
+    if (recorded) {
+      sflog('info', `recorded ${recorded.frames} frames, ${recorded.sampleRate} Hz`);
+      showDocument(recorded, 'recording');
+    } else {
+      // Nothing was captured: keep whatever was open and say so, rather than blanking the UI.
+      $('fileMeta').textContent = info ? fmtMeta(currentName, info) : 'no file';
+      showError('Nothing was recorded.');
+    }
+  } catch (e) {
+    $('fileMeta').textContent = info ? fmtMeta(currentName, info) : 'no file';
+    showError(`Could not save the recording: ${e.message || e}`);
+  }
+}
+
 // ---------- view changes ----------
 
 function setView(v) {
@@ -668,6 +760,7 @@ wrap.addEventListener(
 
 $('openBtn').addEventListener('click', pickFile);
 $('closeBtn').addEventListener('click', closeFile);
+$('recBtn').addEventListener('click', toggleRecord);
 $('saveBtn').addEventListener('click', saveFile);
 $('playBtn').addEventListener('click', transport);
 $('normBtn').addEventListener('click', () => runEdit('normalize'));
@@ -686,6 +779,9 @@ $('chSel').addEventListener('change', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  // While recording the transport, edits and save are all disabled; the shortcuts must be too,
+  // or the space bar would start playing under the live capture.
+  if (recording) return;
   if (!info) return;
   if ((e.metaKey || e.ctrlKey) && e.key === 'a') {
     e.preventDefault();
@@ -738,6 +834,14 @@ if (TAURI && TAURI.event && typeof TAURI.event.listen === 'function') {
     const p = e.payload && e.payload.paths && e.payload.paths[0];
     if (p) openPath(p);
   });
+}
+
+// Recording needs the backend (the input device lives in Rust), so it is only offered when the
+// IPC bridge is present — opened directly in a browser, the button stays disabled like the
+// rest. It records into a new document, so unlike the transport it is available with no file
+// open.
+if (TAURI && TAURI.core && typeof TAURI.core.invoke === 'function') {
+  $('recBtn').disabled = false;
 }
 
 fitCanvases();
