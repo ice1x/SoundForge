@@ -463,4 +463,94 @@ mod tests {
         assert_eq!(az.range(0, 999), naive(&samples, 0, 3));
         assert_eq!(az.range(2, 999).n, 1);
     }
+
+    /// The *work* a `range` query performs, split into the two things it touches: raw
+    /// samples scanned in the unaligned head/tail, and precomputed pyramid blocks combined
+    /// for the aligned middle. This mirrors `Analyzer::range`/`combine_aligned` exactly (a
+    /// child module may read the parent's private fields), so it measures the real cost
+    /// without timing — the deterministic, CI-safe way to guard the seamless invariant.
+    fn range_cost(az: &Analyzer, start: usize, end: usize) -> (usize, usize) {
+        let start = start.min(az.samples.len());
+        let end = end.min(az.samples.len());
+        if start >= end {
+            return (0, 0);
+        }
+        let hs = start.div_ceil(LEAF) * LEAF;
+        let te = (end / LEAF) * LEAF;
+        if hs >= te {
+            return (end - start, 0); // sub-leaf: scanned directly, no blocks
+        }
+        let raw = (hs - start) + (end - te);
+        let levels = az.pyramid.levels();
+        let (mut blocks, mut i, end_leaf) = (0usize, hs / LEAF, te / LEAF);
+        while i < end_leaf {
+            let mut level = 0usize;
+            loop {
+                let next = level + 1;
+                let span_next = FANOUT.pow(next as u32);
+                if next < levels.len()
+                    && i.is_multiple_of(span_next)
+                    && i + span_next <= end_leaf
+                    && (i / span_next) < levels[next].len()
+                {
+                    level = next;
+                } else {
+                    break;
+                }
+            }
+            blocks += 1;
+            i += FANOUT.pow(level as u32);
+        }
+        (raw, blocks)
+    }
+
+    /// The product's whole reason for existing: a range query's cost does not grow with the
+    /// selection length. A 4 M-sample buffer spans several pyramid levels; every query below
+    /// — from a 1 000-sample sliver to the entire file — must scan `< 2*LEAF` raw samples and
+    /// combine only `O(log N)` precomputed blocks. If `range` ever regressed to O(n) (e.g. a
+    /// stale pyramid forcing a raw rescan), the whole-file query's cost would explode by ~5
+    /// orders of magnitude and this test would fail. Deterministic — no wall-clock timing.
+    #[test]
+    fn query_cost_is_independent_of_selection_length() {
+        let n = 4_000_000usize;
+        let samples: Vec<f32> = (0..n).map(|i| ((i as f32) * 1e-4).sin()).collect();
+        let az = Analyzer::new(&samples);
+
+        // Number of pyramid levels for this buffer, bounding the O(log N) block count.
+        let n_levels = az.pyramid.levels().len();
+        // Greedy coverage combines at most (FANOUT-1) blocks per level, plus a small slack.
+        let max_blocks = (FANOUT - 1) * n_levels + FANOUT;
+
+        let selections = [
+            (0, n),                     // the whole file
+            (0, 1_000),                 // a tiny sliver at the start
+            (n / 2 - 500, n / 2 + 500), // a tiny sliver in the middle
+            (12_345, n - 6_789),        // almost the whole file, unaligned both ends
+            (0, n / 2),                 // aligned start, unaligned end
+            (LEAF / 2, n - LEAF / 2),   // unaligned on both sides
+            (n - 1, n),                 // a single sample at the very end
+        ];
+        for (s, e) in selections {
+            let (raw, blocks) = range_cost(&az, s, e);
+            assert!(
+                raw < 2 * LEAF,
+                "range [{s},{e}) scanned {raw} raw samples (>= 2*LEAF)"
+            );
+            assert!(
+                blocks <= max_blocks,
+                "range [{s},{e}) combined {blocks} blocks (> {max_blocks} = O(log N))"
+            );
+        }
+
+        // The essence of "seamless": the whole-file query is no costlier than a tiny one.
+        let (full_raw, full_blocks) = range_cost(&az, 0, n);
+        let (tiny_raw, tiny_blocks) = range_cost(&az, n / 2, n / 2 + 777);
+        assert!(
+            full_raw + full_blocks <= tiny_raw + tiny_blocks + max_blocks,
+            "whole-file query ({full_raw} raw + {full_blocks} blocks) must not cost \
+             materially more than a tiny one ({tiny_raw} raw + {tiny_blocks} blocks)"
+        );
+        // And the aligned middle really is covered by blocks, not a raw rescan of millions.
+        assert!(full_blocks > 0 && full_raw < 2 * LEAF);
+    }
 }

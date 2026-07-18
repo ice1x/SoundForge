@@ -17,6 +17,10 @@
 #   core       Build the pure-Rust analysis core (sf-core) in release mode.
 #   build      Debug build of the whole workspace.
 #   release    Optimized release build of the whole workspace (default).
+#   bench      Run the seamless-statistics benchmark (task 18): a 2-hour (~1.2 GB)
+#              file, asserting stats update < 5 ms/drag, independent of selection
+#              length, with a stable resident set. Kept out of `check` (too heavy
+#              for CI); tune with SF_BENCH_SECS / SF_BENCH_SR / SF_BENCH_MOVES.
 #   app        Bundle the native app (.app/.dmg/...) via `cargo tauri build`.
 #   dev        Run the app in watch mode via `cargo tauri dev`.
 #   clean      Remove build artifacts (cargo clean).
@@ -117,6 +121,14 @@ cmd_dev() {
   exec "${CARGO}" tauri dev
 }
 
+cmd_bench() {
+  step "Seamless-statistics benchmark (task 18)"
+  # A plain self-checking `fn main` (harness = false): it prints a latency table and
+  # exits non-zero if the < 5 ms/drag, length-independence, or RAM-stability checks fail.
+  "${CARGO}" bench -p sf-core --bench seamless
+  ok "benchmark passed"
+}
+
 cmd_clean() {
   step "Cleaning build artifacts"
   "${CARGO}" clean
@@ -142,6 +154,7 @@ main() {
     core) cmd_core ;;
     build) cmd_build ;;
     release) cmd_release ;;
+    bench) cmd_bench ;;
     app) cmd_app ;;
     dev) cmd_dev ;;
     clean) cmd_clean ;;
