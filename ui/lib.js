@@ -181,6 +181,58 @@ export function recMeta(status) {
   return `● recording — ${fmtTime(status.durationS)}${dropped}`;
 }
 
+// ---------- level meter ----------
+
+/// The bottom of the meter's dB scale. Anything at or below this reads as an empty bar; 0 dBFS
+/// (a linear peak of 1.0) fills it. Matches the range a SoundForge-style record/play meter shows
+/// — quiet enough to see a signal's noise floor, without the whole bar living in the last pixel.
+export const METER_FLOOR_DB = -60;
+
+/// A linear peak magnitude (0..1, or above 1 when clipping) to a 0..1 bar fraction, on a dB
+/// scale so the meter behaves like an ear rather than like a linear voltmeter.
+///
+/// The backend reports the raw peak of what is being played or recorded (see `crate::meter`);
+/// turning it into a dB-scaled bar is the UI's job, the same division of labour as `db()` for
+/// the Statistics panel. Silence and anything at/below the floor map to 0; a peak at or above
+/// full scale saturates the bar at 1.
+export function meterFraction(peak, floorDb = METER_FLOOR_DB) {
+  if (!(peak > 0)) return 0;
+  const d = 20 * Math.log10(peak);
+  if (d >= 0) return 1;
+  return clamp((d - floorDb) / -floorDb, 0, 1);
+}
+
+/// The dB label for a bar fraction — the inverse of `meterFraction`. Shows the current meter
+/// reading as a number, `-∞` for an empty bar, mirroring the Statistics panel's `db()`.
+export function meterDbLabel(fraction, floorDb = METER_FLOOR_DB) {
+  if (fraction <= 0) return '-∞';
+  const d = floorDb * (1 - clamp(fraction, 0, 1));
+  return (d > 0 ? '+' : '') + d.toFixed(1);
+}
+
+/// Whether the level meter should be live: while recording, or while a stream is actually
+/// playing. A paused, finished or stopped transport has no signal to show, so the bar decays
+/// to empty.
+export function meterActive(playbackState, recording) {
+  return !!recording || playbackState === 'playing';
+}
+
+/// One frame of meter ballistics: rise instantly to a new peak, fall back by at most `fall`.
+///
+/// A meter that snapped to every value would be an unreadable flicker; a real one shoots up on a
+/// transient and eases down. The decay runs on animation frames in `app.js`, not on the audio
+/// clock, so it stays smooth between the (slower) backend polls. `prev`/`target`/`fall` are all
+/// 0..1 bar fractions.
+export function decayMeter(prev, target, fall) {
+  return target >= prev ? target : Math.max(target, prev - fall);
+}
+
+/// Whether a peak is at or above full scale — the meter's clip indicator. At 0 dBFS a float
+/// signal is already at the ceiling, so `>= 1` is the honest test.
+export function isClipping(peak) {
+  return peak >= 1;
+}
+
 /// Run `fn` with at most one call in flight, always finishing with the newest arguments.
 ///
 /// A selection drag fires mouse-moves far faster than an IPC round-trip completes. Awaiting

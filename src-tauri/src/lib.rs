@@ -20,6 +20,7 @@
 
 pub mod audio;
 pub mod cache;
+pub mod meter;
 pub mod player;
 pub mod recorder;
 

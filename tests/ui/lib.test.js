@@ -9,12 +9,14 @@ import assert from 'node:assert/strict';
 
 import {
   MAX_BINS,
+  METER_FLOOR_DB,
   MIN_VIEW_SAMPLES,
   NNBSP,
   binsForView,
   clamp,
   createCoalescer,
   db,
+  decayMeter,
   effectiveRange,
   exportFileName,
   fitView,
@@ -22,6 +24,10 @@ import {
   fmtMeta,
   fmtTime,
   hasSelection,
+  isClipping,
+  meterActive,
+  meterDbLabel,
+  meterFraction,
   nextPlaybackAction,
   normalizeSelection,
   panBy,
@@ -410,4 +416,59 @@ test('recMeta flags dropped frames only when some were dropped', () => {
   // visible rather than silent.
   assert.doesNotMatch(recMeta({ durationS: 1, overruns: 0 }), /dropped/);
   assert.equal(recMeta({ durationS: 1, overruns: 4200 }), `● recording — 1.000 s · 4${NNBSP}200 frames dropped`);
+});
+
+// ---------- level meter ----------
+
+test('meterFraction maps silence and the floor to an empty bar', () => {
+  assert.equal(meterFraction(0), 0);
+  assert.equal(meterFraction(-0.5), 0, 'a negative/garbage peak is empty, not full');
+  // -60 dB is the floor (10^(-60/20) = 0.001), so it sits right at the bottom.
+  assert.equal(meterFraction(0.001), 0);
+});
+
+test('meterFraction fills the bar at and above full scale', () => {
+  assert.equal(meterFraction(1), 1, '0 dBFS fills the meter');
+  assert.equal(meterFraction(2), 1, 'a clipping peak saturates rather than overflowing');
+});
+
+test('meterFraction is a linear dB scale between the floor and full scale', () => {
+  // -30 dB is exactly halfway up a -60 dB..0 dB scale.
+  const half = meterFraction(10 ** (-30 / 20));
+  assert.ok(Math.abs(half - 0.5) < 1e-9, `expected ~0.5, got ${half}`);
+  // -6 dB (linear 0.5) sits near the top.
+  const near = meterFraction(0.5);
+  assert.ok(Math.abs(near - (60 - 6.0206) / 60) < 1e-3, `got ${near}`);
+});
+
+test('meterFraction honours a custom floor', () => {
+  // With a -40 dB floor, -20 dB is halfway.
+  assert.ok(Math.abs(meterFraction(10 ** (-20 / 20), -40) - 0.5) < 1e-9);
+});
+
+test('meterDbLabel is the inverse of meterFraction', () => {
+  assert.equal(meterDbLabel(0), '-∞');
+  assert.equal(meterDbLabel(1), '0.0');
+  assert.equal(meterDbLabel(0.5), (METER_FLOOR_DB / 2).toFixed(1)); // -30.0
+});
+
+test('meterActive is on while recording or actually playing, off otherwise', () => {
+  assert.equal(meterActive('playing', false), true);
+  assert.equal(meterActive('stopped', true), true, 'recording drives the meter with no file open');
+  assert.equal(meterActive('paused', false), false);
+  assert.equal(meterActive('finished', false), false);
+  assert.equal(meterActive('stopped', false), false);
+});
+
+test('decayMeter rises instantly and falls by at most the step', () => {
+  assert.equal(decayMeter(0.2, 0.9, 0.05), 0.9, 'a louder peak snaps up immediately');
+  assert.equal(decayMeter(0.9, 0.5, 0.1), 0.8, 'a quieter reading eases down by one step');
+  assert.equal(decayMeter(0.3, 0.29, 0.1), 0.29, 'never falls past the target');
+  assert.equal(decayMeter(0.5, 0.5, 0.1), 0.5);
+});
+
+test('isClipping trips only at or above full scale', () => {
+  assert.equal(isClipping(0.999), false);
+  assert.equal(isClipping(1), true);
+  assert.equal(isClipping(1.4), true);
 });

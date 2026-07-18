@@ -33,6 +33,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 use sf_core::PcmCache;
 
+use crate::meter::{buffer_peak, PeakCell};
+
 /// How much audio the ring holds. Long enough that a descheduled feeder thread cannot
 /// starve the callback, short enough that `pause` and `stop` feel immediate — everything
 /// already in the ring has to drain before a change is heard.
@@ -118,6 +120,9 @@ pub struct PlaybackDto {
     pub end_frame: u64,
     /// Callbacks that found the ring short. Non-zero means audible dropouts.
     pub underruns: u64,
+    /// Peak output magnitude since the last poll, for the level meter. `0.0` while idle,
+    /// `>= 1.0` when the output is clipping. See [`crate::meter`].
+    pub peak: f32,
 }
 
 /// State shared between the audio callback, the feeder thread and the UI.
@@ -132,6 +137,9 @@ pub struct Shared {
     /// Set by the feeder once the source is exhausted.
     feed_done: AtomicBool,
     underruns: AtomicU64,
+    /// Peak of the samples handed to the device since the UI last polled — the level meter's
+    /// input. Written only by the audio callback ([`render`]), read-and-reset by the UI.
+    peak: PeakCell,
     /// Immutable after construction — set before the `Arc` is shared.
     dev_channels: usize,
     start_frame: u64,
@@ -167,6 +175,10 @@ impl Shared {
             start_frame: self.start_frame,
             end_frame: self.end_frame,
             underruns: self.underruns.load(Ordering::Relaxed),
+            // Read-and-reset: the meter wants the peak since the previous poll (see
+            // [`crate::meter`]). The UI polls `status` per frame; the other callers of `dto`
+            // (start, pause/resume/stop) reset it momentarily, which the next callback refills.
+            peak: self.peak.take(),
         }
     }
 }
@@ -319,6 +331,9 @@ pub fn render(consumer: &mut rtrb::Consumer<f32>, out: &mut [f32], shared: &Shar
         shared
             .played
             .fetch_add((got / ch) as u64, Ordering::Relaxed);
+        // Feed the level meter from exactly what reached the device — silence written for an
+        // underrun below is deliberately excluded, so a dropout reads as a dip, not a level.
+        shared.peak.record(buffer_peak(&out[..got]));
     }
 
     if got < want {
@@ -437,6 +452,7 @@ impl Player {
             start_frame: 0,
             end_frame: 0,
             underruns: 0,
+            peak: 0.0,
         }
     }
 
@@ -490,6 +506,7 @@ impl Player {
             played: AtomicU64::new(0),
             feed_done: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
+            peak: PeakCell::new(),
             dev_channels: chosen.channels as usize,
             start_frame: start as u64,
             end_frame: end as u64,
@@ -713,6 +730,7 @@ mod tests {
             played: AtomicU64::new(0),
             feed_done: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
+            peak: PeakCell::new(),
             dev_channels,
             start_frame: start,
             end_frame: end,
@@ -963,6 +981,25 @@ mod tests {
     }
 
     #[test]
+    fn render_feeds_the_level_meter_with_the_output_peak() {
+        // A signal that swings to ±0.8: the meter must read 0.8, whatever the sign.
+        let (cache, _c) = pcm(&[vec![0.2, -0.8, 0.5, -0.1]], 48_000);
+        let mut src = Source::new(cache, 0, 4, 1, 48_000);
+        let shared = shared_for(1, 0, 4, 1.0, 48_000);
+        let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(16);
+        pump(&mut prod, &mut src, &shared);
+        let mut out = [0.0f32; 4];
+        render(&mut cons, &mut out, &shared);
+        assert!(
+            (shared.peak.peek() - 0.8).abs() < 1e-6,
+            "meter peak follows the loudest output sample"
+        );
+        // And the DTO reports it, read-and-reset.
+        assert!((shared.dto().peak - 0.8).abs() < 1e-6);
+        assert_eq!(shared.peak.peek(), 0.0, "reading the DTO resets the meter");
+    }
+
+    #[test]
     fn an_underrun_yields_silence_and_is_counted() {
         // A starved callback must play silence, not stale audio, and must not claim the
         // playhead advanced through sound nobody heard.
@@ -1205,6 +1242,7 @@ mod tests {
             "startFrame",
             "endFrame",
             "underruns",
+            "peak",
         ] {
             assert!(dto.get(key).is_some(), "missing key {key}");
             assert!(!dto[key].is_null(), "{key} serialized as null");

@@ -40,6 +40,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 use sf_core::{CaptureWriter, DecodeError};
 
+use crate::meter::{buffer_peak, PeakCell};
 use crate::player::{Chosen, ConfigRange};
 
 /// How much audio the ring can hold before the writer must have drained it. Generous compared
@@ -109,6 +110,9 @@ pub struct RecordDto {
     pub sample_rate: u32,
     /// Frames the writer could not keep up with and dropped. Non-zero means gaps in the take.
     pub overruns: u64,
+    /// Peak input magnitude since the last poll, for the level meter. `0.0` on silence,
+    /// `>= 1.0` when the input is clipping. See [`crate::meter`].
+    pub peak: f32,
 }
 
 /// What a finished recording produced, handed to the shell so it can adopt the planar cache as
@@ -180,6 +184,9 @@ struct Shared {
     frames: AtomicU64,
     /// Frames dropped because the ring was full when the callback fired.
     overruns: AtomicU64,
+    /// Peak of the input frames seen since the UI last polled — the level meter's input.
+    /// Written only by the input callback ([`ingest`]), read-and-reset by the UI.
+    peak: PeakCell,
     /// Immutable after construction.
     channels: usize,
     sample_rate: u32,
@@ -195,6 +202,9 @@ impl Shared {
             channels: self.channels,
             sample_rate: self.sample_rate,
             overruns: self.overruns.load(Ordering::Relaxed),
+            // Read-and-reset: the peak since the previous poll. The UI polls `status` while
+            // recording; `start` reads it once (returning 0), which the callback then refills.
+            peak: self.peak.take(),
         }
     }
 }
@@ -204,16 +214,22 @@ impl Shared {
 ///
 /// Writes as many whole frames as fit; any that do not are dropped and counted in `overruns`.
 /// Whole-frame writes are what let [`drain`] reconstruct channels unambiguously.
+///
+/// Also feeds the level meter from the *whole* batch the device delivered — including any
+/// frames dropped for overrun below — so the meter reflects what the microphone heard even
+/// when the writer briefly fell behind.
 pub fn ingest(
     producer: &mut rtrb::Producer<f32>,
     input: &[f32],
     channels: usize,
     overruns: &AtomicU64,
+    peak: &PeakCell,
 ) {
     let frames = input.len() / channels;
     if frames == 0 {
         return;
     }
+    peak.record(buffer_peak(input));
     let free_frames = producer.slots() / channels;
     let take_frames = frames.min(free_frames);
     let take = take_frames * channels;
@@ -300,6 +316,7 @@ impl Recorder {
             channels: 0,
             sample_rate: 0,
             overruns: 0,
+            peak: 0.0,
         }
     }
 
@@ -345,6 +362,7 @@ impl Recorder {
             state: AtomicU8::new(1),
             frames: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
+            peak: PeakCell::new(),
             channels: chosen.channels as usize,
             sample_rate: chosen.sample_rate,
         });
@@ -480,7 +498,13 @@ fn record_thread(
     let stream = device.build_input_stream(
         config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            ingest(&mut producer, data, channels, &cb_shared.overruns);
+            ingest(
+                &mut producer,
+                data,
+                channels,
+                &cb_shared.overruns,
+                &cb_shared.peak,
+            );
         },
         |e| log::error!("audio input stream error: {e}"),
         None,
@@ -670,15 +694,18 @@ mod tests {
         let (mut w, _c) = writer(2, 48_000);
         let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(ring_capacity(48_000, 2));
         let overruns = AtomicU64::new(0);
+        let peak = PeakCell::new();
 
         // Two interleaved stereo batches.
-        ingest(&mut prod, &[1.0, -1.0, 2.0, -2.0], 2, &overruns);
-        ingest(&mut prod, &[3.0, -3.0], 2, &overruns);
+        ingest(&mut prod, &[1.0, -1.0, 2.0, -2.0], 2, &overruns, &peak);
+        ingest(&mut prod, &[3.0, -3.0], 2, &overruns, &peak);
 
         let mut scratch = Vec::new();
         let drained = drain(&mut cons, &mut w, 2, &mut scratch).unwrap();
         assert_eq!(drained, 3);
         assert_eq!(overruns.load(Ordering::Relaxed), 0);
+        // The meter saw the loudest sample across both batches.
+        assert_eq!(peak.peek(), 3.0);
 
         let pcm = w.finish().unwrap();
         assert_eq!(pcm.channel(0), &[1.0, 2.0, 3.0]);
@@ -692,9 +719,18 @@ mod tests {
         // A ring that holds only 4 frames.
         let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(4);
         let overruns = AtomicU64::new(0);
+        let peak = PeakCell::new();
 
-        ingest(&mut prod, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 1, &overruns);
+        ingest(
+            &mut prod,
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            1,
+            &overruns,
+            &peak,
+        );
         assert_eq!(overruns.load(Ordering::Relaxed), 2, "two frames dropped");
+        // The meter reflects the whole batch — including the frames dropped for overrun.
+        assert_eq!(peak.peek(), 5.0);
 
         let mut scratch = Vec::new();
         drain(&mut cons, &mut w, 1, &mut scratch).unwrap();
@@ -719,6 +755,7 @@ mod tests {
         let (mut w, _c) = writer(2, 48_000);
         let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(ring_capacity(48_000, 2).min(26));
         let overruns = AtomicU64::new(0);
+        let peak = PeakCell::new();
 
         let mut next = 0i32;
         // Feed 500 frames through in 7-frame batches, draining between each so the ring wraps.
@@ -732,7 +769,7 @@ mod tests {
                 batch.push(-(next as f32));
                 next += 1;
             }
-            ingest(&mut prod, &batch, 2, &overruns);
+            ingest(&mut prod, &batch, 2, &overruns, &peak);
             let mut scratch = Vec::new();
             drain(&mut cons, &mut w, 2, &mut scratch).unwrap();
         }
@@ -789,10 +826,24 @@ mod tests {
             "channels",
             "sampleRate",
             "overruns",
+            "peak",
         ] {
             assert!(v.get(key).is_some(), "missing key {key}");
             assert!(!v[key].is_null(), "{key} serialized as null");
         }
+    }
+
+    #[test]
+    fn ingest_reports_the_input_peak_ignoring_sign() {
+        let (mut prod, _cons) = rtrb::RingBuffer::<f32>::new(ring_capacity(48_000, 1));
+        let overruns = AtomicU64::new(0);
+        let peak = PeakCell::new();
+        ingest(&mut prod, &[0.1, -0.6, 0.2], 1, &overruns, &peak);
+        assert_eq!(
+            peak.peek(),
+            0.6,
+            "the meter follows the loudest input sample"
+        );
     }
 
     /// The one test that needs real hardware: it opens the default input device and captures a
