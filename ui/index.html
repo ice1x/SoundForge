@@ -69,6 +69,27 @@
   .drop-hint b{color:var(--ink)}
   .transport{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .transport .time{font-family:var(--mono);color:var(--dim);font-size:12px;margin-left:6px}
+  /* Level meter — the peak of what is being recorded or played, SoundForge-style. The colour
+     ramp lives on the track (fixed), and a panel-coloured mask hides the un-reached part, so
+     the green→amber→red thresholds stay anchored to their dB positions as the bar moves. */
+  .meter{display:flex;align-items:center;gap:8px}
+  .meter .cap{font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--dim);text-transform:uppercase}
+  .meter-track{
+    position:relative;flex:1;height:12px;border:1px solid var(--line);border-radius:3px;overflow:hidden;
+    background:linear-gradient(90deg,
+      var(--green) 0%, var(--green) 55%, #b9d24a 70%, var(--amber) 88%, var(--red) 100%);
+  }
+  /* Faint dB graticule at -18, -12, -6 dB (fractions .70, .80, .90 on a -60..0 scale). */
+  .meter-ticks{position:absolute;inset:0;pointer-events:none;
+    background-image:linear-gradient(90deg,transparent 0,transparent calc(70% - 1px),rgba(11,13,16,.5) 70%,transparent calc(70% + 1px)),
+      linear-gradient(90deg,transparent 0,transparent calc(80% - 1px),rgba(11,13,16,.5) 80%,transparent calc(80% + 1px)),
+      linear-gradient(90deg,transparent 0,transparent calc(90% - 1px),rgba(11,13,16,.5) 90%,transparent calc(90% + 1px));}
+  .meter-mask{position:absolute;top:0;right:0;bottom:0;width:100%;background:var(--panel);transition:none}
+  .meter-hold{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--ink);opacity:0}
+  .meter-db{font-family:var(--mono);font-size:11px;color:var(--dim);min-width:42px;text-align:right;font-variant-numeric:tabular-nums}
+  .meter.idle{opacity:.45}
+  .meter.clip .meter-db{color:var(--red)}
+  .meter.clip .cap::after{content:" CLIP";color:var(--red)}
   .edits{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}
   .right{
     width:300px;border-left:1px solid var(--line);background:var(--panel);
@@ -131,6 +152,16 @@
         <span class="kbd">drag out a selection → the statistics on the right follow it live</span>
         <span class="kbd">wheel to zoom, shift+wheel to scroll</span>
       </div>
+    </div>
+
+    <div class="meter idle" id="meter" title="Level — peak of what is being recorded or played back">
+      <span class="cap" id="meterCap">Level</span>
+      <div class="meter-track">
+        <div class="meter-ticks"></div>
+        <div class="meter-mask" id="meterMask"></div>
+        <div class="meter-hold" id="meterHold"></div>
+      </div>
+      <span class="meter-db" id="meterDb">-∞</span>
     </div>
 
     <div class="transport">

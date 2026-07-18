@@ -11,12 +11,17 @@
 import {
   binsForView,
   createCoalescer,
+  decayMeter,
   effectiveRange,
   exportFileName,
   fitView,
   fmtMeta,
   fmtTime,
   hasSelection,
+  isClipping,
+  meterActive,
+  meterDbLabel,
+  meterFraction,
   nextPlaybackAction,
   normalizeSelection,
   panBy,
@@ -322,6 +327,8 @@ function applyPlayback(dto) {
   const wasClean = playback.underruns === 0;
   playback = dto;
   $('playBtn').textContent = playLabel(dto.state);
+  // Drive the level meter from what actually reached the device this poll.
+  feedMeter(dto.peak || 0);
   // Dropouts are inaudible in a log file but obvious in the ear; record the first one so a
   // "playback sounds glitchy" report has evidence behind it.
   if (wasClean && dto.underruns > 0) {
@@ -365,6 +372,7 @@ async function transport() {
       followPlayhead();
     } else {
       // Play exactly what the Statistics panel describes.
+      resetMeter(); // a fresh playback clears any latched clip from the last one
       const r = effectiveRange(sel, info.frames);
       applyPlayback(await invoke('play', { start: r.start, end: r.end }));
       followPlayhead();
@@ -383,6 +391,80 @@ async function stopPlayback() {
     playback = { state: 'stopped', positionFrames: 0, underruns: 0 };
     $('playBtn').textContent = playLabel('stopped');
   }
+}
+
+// ---------- level meter ----------
+
+// A SoundForge-style peak meter of what is being recorded or played. The backend reports the
+// raw peak per poll (`playback_status.peak` / `recording_status.peak`); everything that makes
+// it *look* like a meter — the dB-scaled bar, the instant-rise/slow-fall ballistics, the
+// peak-hold marker — is done here on animation frames, so it stays smooth between the (slower)
+// backend polls. All the arithmetic lives in `lib.js` and is unit-tested; this is just the
+// DOM wiring plus the rAF loop, which cannot be tested without a webview.
+
+const meterEl = $('meter');
+const meterMask = $('meterMask');
+const meterHold = $('meterHold');
+const meterDb = $('meterDb');
+
+/// Per-frame decay of the bar and of the peak-hold marker (as 0..1 fractions). The bar falls
+/// fast enough to track the signal; the hold lingers above it so a transient stays readable.
+const METER_FALL = 0.03;
+const METER_HOLD_FALL = 0.006;
+
+let meterBar = 0; // fraction currently drawn
+let meterHoldFrac = 0; // peak-hold marker fraction
+let meterTarget = 0; // loudest fraction fed since the last frame
+let meterClip = false; // latched until the meter goes idle
+let meterRaf = null;
+
+/// Push one backend peak reading into the meter. Called on every playback/recording poll.
+function feedMeter(peak) {
+  meterTarget = Math.max(meterTarget, meterFraction(peak));
+  if (isClipping(peak)) meterClip = true;
+  ensureMeterAnim();
+}
+
+/// Reset the meter for a fresh take/playback: clear the latched clip and any stale target.
+function resetMeter() {
+  meterClip = false;
+  meterTarget = 0;
+  ensureMeterAnim();
+}
+
+/// Start the animation loop if it is not already running. It runs while the meter is active or
+/// still has a bar to decay, then stops itself — so an idle app does no per-frame work.
+function ensureMeterAnim() {
+  if (meterRaf !== null) return;
+  const step = () => {
+    meterBar = decayMeter(meterBar, meterTarget, METER_FALL);
+    // The hold snaps up to the bar and eases down more slowly than it.
+    meterHoldFrac = decayMeter(meterHoldFrac, meterBar, METER_HOLD_FALL);
+    meterTarget = 0; // consumed; the next poll refills it before the next frame
+    drawMeter();
+
+    if (meterActive(playback.state, recording) || meterBar > 0.001 || meterHoldFrac > 0.001) {
+      meterRaf = requestAnimationFrame(step);
+    } else {
+      // Fully decayed and nothing to show: settle to empty and stop the loop.
+      meterRaf = null;
+      meterBar = 0;
+      meterHoldFrac = 0;
+      meterClip = false;
+      drawMeter();
+    }
+  };
+  meterRaf = requestAnimationFrame(step);
+}
+
+function drawMeter() {
+  // The mask hides the un-reached (right) part of the fixed colour ramp.
+  meterMask.style.width = `${(1 - meterBar) * 100}%`;
+  meterHold.style.left = `${meterHoldFrac * 100}%`;
+  meterHold.style.opacity = meterHoldFrac > 0.001 ? '1' : '0';
+  meterDb.textContent = meterDbLabel(meterHoldFrac);
+  meterEl.classList.toggle('clip', meterClip);
+  meterEl.classList.toggle('idle', !meterActive(playback.state, recording) && meterBar <= 0.001);
 }
 
 // ---------- edits ----------
@@ -639,7 +721,10 @@ async function pollRecording() {
     while (recording) {
       const status = await invoke('recording_status');
       // `recording` may have been cleared by `toggleRecord` while this was in flight.
-      if (recording) $('fileMeta').textContent = recMeta(status);
+      if (recording) {
+        $('fileMeta').textContent = recMeta(status);
+        feedMeter(status.peak || 0);
+      }
       await new Promise((r) => setTimeout(r, 100));
     }
   } catch (e) {
@@ -659,6 +744,7 @@ async function toggleRecord() {
       await invoke('start_recording');
       recording = true;
       setRecordingUI(true);
+      resetMeter(); // fresh take: clear any latched clip and light the meter immediately
       pollRecording();
     } catch (e) {
       showError(`Could not start recording: ${e.message || e}`);
