@@ -239,12 +239,43 @@ list; the most useful commands are:
 
 | Command | What it does |
 |---|---|
-| `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` + the `ui/` tests — the gate that must be green before pushing (mirrors CI) |
+| `scripts/build.sh check` | `fmt --check`, `clippy -D warnings`, `test` + the `ui/` and build-script tests — the gate that must be green before pushing (mirrors CI) |
 | `scripts/build.sh ui` | just the `ui/` tests (`node --test`) |
 | `scripts/build.sh bench` | the seamless-statistics benchmark (task 18) — see [Benchmark](#benchmark) |
 | `scripts/build.sh release` | optimized release build of the whole workspace (default) |
-| `scripts/build.sh app` | bundle the native `.app`/`.dmg` via `cargo tauri build` |
+| `scripts/build.sh app` | bundle the signed Apple-Silicon `.app`/`.dmg` — see [Packaging & signing](#packaging--signing) |
 | `scripts/build.sh dev` | run the app in watch mode via `cargo tauri dev` |
+
+### Packaging & signing
+
+`scripts/build.sh app` bundles the macOS `.app` and `.dmg` for Apple Silicon (task 19). It
+runs `cargo tauri build --target aarch64-apple-darwin`, so the binary is always arm64
+regardless of the host; override the target with `SF_APP_TARGET` (e.g. a
+`universal-apple-darwin` build) and pass anything extra straight through
+(`scripts/build.sh app --bundles dmg`). `SF_APP_DRY_RUN=1` prints the command without
+running it.
+
+The bundle config lives in [`src-tauri/tauri.conf.json`](src-tauri/tauri.conf.json)
+(`bundle.macOS`): a `minimumSystemVersion` of `11.0` (the first Apple-Silicon macOS) and an
+[`entitlements.plist`](src-tauri/entitlements.plist). The entitlements grant
+`com.apple.security.device.audio-input`, which the **hardened runtime** (required for
+notarization) otherwise revokes — without it, recording (task 15) would die on the first
+mic access even though [`Info.plist`](src-tauri/Info.plist) carries the usage string.
+
+Signing and notarization are driven entirely by the environment variables Tauri reads — the
+repo hard-codes no identity, and with none of them set you still get a working (unsigned)
+local build:
+
+| To… | Set |
+|---|---|
+| **code-sign** | `APPLE_SIGNING_IDENTITY` (a keychain "Developer ID Application: …" identity), _or_ `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD` (a base64 `.p12`) |
+| **notarize** | `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID`, _or_ `APPLE_API_KEY` + `APPLE_API_ISSUER` + `APPLE_API_KEY_PATH` (App Store Connect key) |
+
+`build.sh app` reports whether the run will be signed or unsigned before it starts. The pure
+argv/signing logic is unit-tested in [`tests/build/app.test.sh`](tests/build/app.test.sh) and
+the bundle/entitlements wiring in
+[`src-tauri/tests/bundle_config_integration.rs`](src-tauri/tests/bundle_config_integration.rs),
+both part of `scripts/build.sh check`.
 
 ---
 
@@ -277,4 +308,4 @@ This task list is the **single source of truth** for the project. Format:
 - [x] 16 — Edits + undo (`normalize`/`fade in`/`fade out`/`silence`/`trim`) over the PCM cache
 - [x] 17 — WAV export (`hound`) of selection or whole file
 - [x] 18 — Seamless benchmark: 2-hour (~1.2 GB) file, stats update < 5 ms/drag, RAM stable
-- [ ] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon
+- [x] 19 — `cargo tauri build` → signed `.app`/`.dmg` for Apple Silicon

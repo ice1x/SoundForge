@@ -31,6 +31,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "entitlements": "entitlements.plist"
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }
