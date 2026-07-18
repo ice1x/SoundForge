@@ -60,6 +60,21 @@ jobs:
       - name: Test (ui)
         run: npm test
 
+  # The build helper (scripts/build.sh) and its pure decision logic — notably the
+  # signed Apple-Silicon bundling argv and signing detection (task 19). shellcheck is
+  # preinstalled on the runner; the tests are plain bash, so this needs nothing else.
+  scripts:
+    name: scripts — shellcheck, build-script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: shellcheck scripts/build.sh tests/build/app.test.sh
+
+      - name: Build-script tests
+        run: bash tests/build/app.test.sh
+
   # Full workspace, including the Tauri shell, on an Apple-Silicon macOS runner.
   # This matches the project's Apple-Silicon-first target and builds the Tauri
   # crate against the native system WebView with no extra system packages.

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened-runtime entitlements for the signed .app (task 19).
+
+    Notarization requires code-signing with the hardened runtime enabled. The hardened
+    runtime otherwise revokes the microphone even from an app whose Info.plist carries the
+    NSMicrophoneUsageDescription string, so recording (task 15, cpal/CoreAudio input) would
+    fail at runtime. This entitlement restores that access; Tauri applies the file to the
+    binary at sign time via `bundle.macOS.entitlements` in tauri.conf.json.
+
+    Kept deliberately minimal: only the microphone is granted. SoundForge loads its UI from
+    the app bundle (no remote code) and links only Apple system frameworks, so it needs
+    neither JIT nor disabled library validation.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
